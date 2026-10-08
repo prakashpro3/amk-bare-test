@@ -121,6 +121,9 @@ android() {
     device=$("$adb" devices | awk 'NR > 1 && $2 == "device" { print $1; exit }')
   fi
   "$adb" -s "$device" install -r "$apk" > /dev/null
+  # system "isn't responding" pop-ups (common on busy emulators) cover the app and fail flows; app crashes still fail them
+  "$adb" -s "$device" shell settings put global hide_error_dialogs 1
+  "$adb" -s "$device" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS > /dev/null 2>&1 || true
   run_flows android "$device" "$app_id"
 }
 
