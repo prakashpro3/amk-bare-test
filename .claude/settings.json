@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/ai/guard.js"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/ai/handoff-check.js"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "ask": [
+      "Bash(npm install *)",
+      "Bash(pnpm add*)",
+      "Bash(yarn add*)",
+      "Edit(**/AndroidManifest.xml)",
+      "Edit(**/Info.plist)",
+      "Edit(.github/workflows/**)",
+      "Edit(android/**/build.gradle)",
+      "Edit(ios/Podfile)",
+      "Edit(package.json)"
+    ],
+    "deny": [
+      "Bash(git clean -f*)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(rm -rf*)",
+      "Bash(xcrun simctl erase*)",
+      "Edit(**/project.pbxproj)",
+      "Read(**/*.jks)",
+      "Read(**/*.keystore)",
+      "Read(**/*.mobileprovision)",
+      "Read(**/*.p12)",
+      "Read(**/*.p8)",
+      "Read(.env)",
+      "Read(.env.*)"
+    ]
+  }
+}

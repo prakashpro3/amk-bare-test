@@ -1,0 +1,27 @@
+default_permissions = "rulesync"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+
+[permissions.rulesync]
+extends = ":workspace"
+
+[permissions.rulesync.filesystem]
+":minimal" = "read"
+glob_scan_max_depth = 8
+
+[permissions.rulesync.filesystem.":workspace_roots"]
+".env" = "deny"
+".env.*" = "deny"
+"**/*.keystore" = "deny"
+"**/*.jks" = "deny"
+"**/*.p8" = "deny"
+"**/*.p12" = "deny"
+"**/*.mobileprovision" = "deny"
+"**/project.pbxproj" = "deny"
+"package.json" = "read"
+"ios/Podfile" = "read"
+"android/**/build.gradle" = "deny"
+"**/Info.plist" = "deny"
+"**/AndroidManifest.xml" = "deny"
+".github/workflows/**" = "read"
+".git/**" = "write"
