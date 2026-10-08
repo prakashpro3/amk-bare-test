@@ -51,8 +51,8 @@ run_flows() { # platform device app_id
   for f in $files; do
     total=$((total + 1))
     name=$(basename "$f" .yaml)
-    # screenshots in flows use relative names, so run Maestro from the evidence folder
-    if (cd "$out" && maestro --device "$2" test -e APP_ID="$3" "$f" > "$out/$name.log" 2>&1); then
+    # screenshots use relative names: older Maestro saves them in the current folder, newer in --test-output-dir
+    if (cd "$out" && maestro --device "$2" test --test-output-dir "$out" -e APP_ID="$3" "$f" > "$out/$name.log" 2>&1); then
       passed=$((passed + 1))
     else
       echo "  $1: flow $name failed, see ${out#"$root"/}/$name.log"
@@ -61,6 +61,10 @@ run_flows() { # platform device app_id
   done
   shots=$(find "$out" -name '*.png' | wc -l | tr -d ' ')
   echo "$1: flows $passed/$total passed, $shots screenshots in ${out#"$root"/}"
+  if [ "$shots" = 0 ]; then
+    echo "  $1: no screenshots were saved, so there's no evidence; treating this as a failure"
+    status=1
+  fi
 }
 
 quick() {
