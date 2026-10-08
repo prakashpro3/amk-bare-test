@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "owned": [
+    {
+      "event": "PreToolUse",
+      "matcher": "",
+      "identity": "command:node scripts/ai/guard.js"
+    },
+    {
+      "event": "Stop",
+      "matcher": "",
+      "identity": "command:node scripts/ai/handoff-check.js"
+    }
+  ]
+}

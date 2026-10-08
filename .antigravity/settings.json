@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "ask": [
+      "command(npm install *)",
+      "command(pnpm add*)",
+      "command(yarn add*)",
+      "write_file(**/AndroidManifest.xml)",
+      "write_file(**/Info.plist)",
+      "write_file(.github/workflows/**)",
+      "write_file(android/**/build.gradle)",
+      "write_file(ios/Podfile)",
+      "write_file(package.json)"
+    ],
+    "deny": [
+      "command(git clean -f*)",
+      "command(git commit --no-verify*)",
+      "command(git push --force*)",
+      "command(git push -f*)",
+      "command(git reset --hard*)",
+      "command(rm -rf*)",
+      "command(xcrun simctl erase*)",
+      "read_file(**/*.jks)",
+      "read_file(**/*.keystore)",
+      "read_file(**/*.mobileprovision)",
+      "read_file(**/*.p12)",
+      "read_file(**/*.p8)",
+      "read_file(.env)",
+      "read_file(.env.*)",
+      "write_file(**/project.pbxproj)"
+    ]
+  }
+}
