@@ -32,9 +32,13 @@ fi
 
 # 4. lint the staged JS/TS files with the project's own ESLint config
 files=$(echo "$staged" | grep -E '\.(js|jsx|ts|tsx)$' || true)
-if [ -n "$files" ] && [ -x node_modules/.bin/eslint ]; then
-  # ponytail: file names with spaces aren't supported here; split on newlines if that ever matters
-  node_modules/.bin/eslint --no-warn-ignored $files || fail "fix the ESLint errors above"
+if [ -n "$files" ]; then
+  if [ -x node_modules/.bin/eslint ]; then
+    # ponytail: file names with spaces aren't supported here; split on newlines if that ever matters
+    node_modules/.bin/eslint $files || fail "fix the ESLint errors above"
+  else
+    echo "pre-commit: ESLint isn't installed, so staged files weren't linted (Expo: run 'npx expo lint' once)" >&2
+  fi
 fi
 
 # 5. warn about large commits (the PR size check in CI is the hard limit)
