@@ -60,6 +60,7 @@ function AppContent() {
         </Text>
         <Switch
           accessibilityLabel="Dark mode"
+          testID="dark-mode-switch"
           value={isDarkMode}
           onValueChange={on => Appearance.setColorScheme(on ? 'dark' : 'light')}
         />

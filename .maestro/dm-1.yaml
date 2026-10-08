@@ -1,0 +1,19 @@
+# DM-1 acceptance criteria, checked on a running app (system theme set to light before this runs).
+appId: ${APP_ID} # org.reactjs.native.example.BareApp (iOS) or com.bareapp (Android)
+---
+- launchApp:
+    clearState: true
+- assertVisible: "Dark mode"        # 1: switch labelled "Dark mode" on the home screen
+- takeScreenshot: dm-1-1-launch   # 2: starts in the system theme (light)
+- tapOn:
+    id: "dark-mode-switch"
+- takeScreenshot: dm-1-2-dark     # 3: dark colors after turning it on
+- tapOn:
+    id: "dark-mode-switch"
+- takeScreenshot: dm-1-3-light    # 4: light colors after turning it off
+- tapOn:
+    id: "dark-mode-switch"
+- stopApp
+- launchApp
+- assertVisible: "Dark mode"
+- takeScreenshot: dm-1-4-relaunch # 5: choice not remembered, light again
