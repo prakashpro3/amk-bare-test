@@ -76,4 +76,6 @@ yarn-error.log
 .env
 .env.*
 !.env.example
+
+# agentic-mobile-kit: secrets stay out of git; .ai/ holds local evidence (screenshots, logs)
 .ai/
