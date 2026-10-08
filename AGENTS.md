@@ -1,11 +1,11 @@
-<!-- KIT:START agentic-mobile-kit (edit outside these markers; the kit updates what's inside) -->
+<!-- KIT:START agentic-mobile-kit 0.4.0 (edit outside these markers; the kit updates what's inside) -->
 # BareApp: instructions for AI agents
 
 Read by Claude Code (through CLAUDE.md), Codex, Cursor, OpenCode, Kiro and Antigravity. Keep it short; details live in `docs/ai/`.
 
 ## Project
 
-- Bare React Native 0.87.1 (New Architecture), React 19.2.3, TypeScript 6.0.3, Node 24. Package manager: Yarn.
+- Bare React Native 0.87.1 (New Architecture), React 19.2.3, TypeScript 6.0.3, Node >= 22.11.0. Package manager: Yarn.
 - What the app does: `docs/ai/product.md`. Stack and services: `docs/ai/tech.md`. Folders and layers: `docs/ai/structure.md`. Code style: `docs/ai/conventions.md`.
 
 ## Commands
@@ -17,12 +17,14 @@ Read by Claude Code (through CLAUDE.md), Codex, Cursor, OpenCode, Kiro and Antig
 | iOS pods (after native dependency changes) | `cd ios && pod install` |
 | iOS build (simulator, no signing) | `sh scripts/ai/ios-build.sh` |
 | Android build | `cd android && ./gradlew assembleDebug` |
+| Check on devices (release builds, Maestro flows, screenshots) | `sh scripts/ai/verify.sh all --spec <id>` |
+| Check a release before tagging it (versions, permission texts, debug leftovers) | `node scripts/ai/release-check.js` |
 
 ## Definition of done
 
 A task is done only when:
 1. lint, typecheck and tests pass, and you show the command output from this session;
-2. UI changes were built and checked on both iOS and Android;
+2. UI changes were checked with `sh scripts/ai/verify.sh all --spec <id>` on both iOS and Android, and you looked at the screenshots;
 3. the change stays inside the task's scope;
 4. `specs/<id>/progress.md` is updated, when working from a spec.
 
