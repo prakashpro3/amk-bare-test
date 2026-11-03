@@ -4,8 +4,9 @@
 //        they pass, 1 when one failed, the failed jobs' last log lines after it as outside text, 2 without gh or a pull
 //        request, 3 when they're still running at the time limit
 //   node scripts/amk/pr.js automerge [<branch>]   turn on auto-merge, so GitHub merges once a person approves and the
-//        checks pass: only with Reviewers: team, and only for a pull request into main (a stacked one waits until GitHub
-//        moves it there). With Reviewers: solo, your amk-ready label turns it on, after your review
+//        checks pass: only with Reviewers: team, only where main requires an approval, and only for a pull request into
+//        main (a stacked one waits until pr.js forward moves it there). With Reviewers: solo, your amk-ready label turns
+//        it on, after your review
 //   node scripts/amk/pr.js comments [<branch>]   its reviews and comments, as outside text
 //   node scripts/amk/pr.js method   the merge method auto-merge uses (Merge method, or the first the repository allows)
 //   node scripts/amk/pr.js forward   merge main into each of the build's branches whose parent pull request has merged:
@@ -35,6 +36,8 @@ const IO = {
   ghText: args => { const r = sh('gh', args, { timeout: 120000 }); return r.status === 0 ? r.stdout : null; },
   ghRun: args => sh('gh', args, { timeout: 120000 }),
   sleep: ms => new Promise(r => setTimeout(r, ms)),
+  // where a wait stands, under .amk/: autopilot.js's stall watchdog counts a change there as activity
+  note: t => { try { fs.mkdirSync(path.join(ROOT, '.amk'), { recursive: true }); fs.writeFileSync(path.join(ROOT, '.amk/pr-checks.txt'), `${new Date().toISOString()} ${t}\n`); } catch {} },
   now: Date.now,
   log: t => console.log(t),
 };
@@ -44,13 +47,27 @@ const mainName = main => (main || '').replace(/^origin\//, '');
 // ---------- checks: wait for them, and hand over a failure's log ----------
 // a fine-grained token can't read checks (GitHub has no such permission for it), so when gh lists none, the GitHub Actions
 // runs on the pull request's last commit, which "actions: read" covers
+const runList = (pr, io) => (pr.headRefOid && io.gh(['run', 'list', '--commit', pr.headRefOid, '--json', 'workflowName,status,conclusion,url', '--limit', '50']) || []).map(r => ({
+  name: r.workflowName, link: r.url,
+  bucket: r.status !== 'completed' ? 'pending' : ['success', 'skipped', 'neutral'].includes(r.conclusion) ? 'pass' : r.conclusion === 'cancelled' ? 'cancel' : 'fail',
+}));
 function checkList(pr, io) {
   const list = io.gh(['pr', 'checks', String(pr.number), '--json', 'name,bucket,link,workflow']) || [];
-  if (list.length || !pr.headRefOid) return list;
-  return (io.gh(['run', 'list', '--commit', pr.headRefOid, '--json', 'workflowName,status,conclusion,url', '--limit', '50']) || []).map(r => ({
-    name: r.workflowName, link: r.url,
-    bucket: r.status !== 'completed' ? 'pending' : ['success', 'skipped', 'neutral'].includes(r.conclusion) ? 'pass' : r.conclusion === 'cancelled' ? 'cancel' : 'fail',
-  }));
+  if (!list.length) return runList(pr, io);
+  // a run that a newer one replaced on the same commit (a label added) leaves its failed or cancelled jobs listed until
+  // the newer run's jobs start: while a run on this commit still goes, a failure isn't the result yet
+  const going = list.some(c => c.bucket === 'fail' || c.bucket === 'cancel') && !list.some(c => c.bucket === 'pending')
+    ? runList(pr, io).filter(r => r.bucket === 'pending') : [];
+  return [...list, ...going];
+}
+// gh run view --log-failed writes "job<TAB>step<TAB>time text" lines: kept, a heading per job and step and the text
+// without times or colours. The summary job (checks) only repeats which jobs failed, so it goes when another one did
+function tidyLog(log) {
+  const rows = log.split('\n').map(l => /^([^\t]+)\t([^\t]+)\t\uFEFF?(?:\d{4}-\d\d-\d\dT[\d:.]+Z ?)?(.*)$/.exec(l)).filter(Boolean)
+    .map(m => ({ head: `${m[1]} › ${m[2]}`, job: m[1], text: m[3].replace(/\x1b\[[0-9;]*[A-Za-z]/g, '') }));
+  if (!rows.length) return log;
+  const kept = rows.some(r => r.job !== 'checks') ? rows.filter(r => r.job !== 'checks') : rows;
+  return kept.map((r, i) => (i && kept[i - 1].head === r.head ? r.text : `== ${r.head}\n${r.text}`)).join('\n');
 }
 async function checks(branch, { waitMs = 30 * 60e3, pollMs = 30e3, firstMs = 3 * 60e3 } = {}, io = IO) {
   const pr = io.gh(['pr', 'view', branch, '--json', 'number,url,state,headRefOid']);
@@ -60,6 +77,7 @@ async function checks(branch, { waitMs = 30 * 60e3, pollMs = 30e3, firstMs = 3 *
   for (;;) {
     list = checkList(pr, io);
     const pending = list.filter(c => c.bucket === 'pending');
+    io.note(`${pr.url}: ${list.length ? `waiting for ${pending.map(c => c.name).join(', ')}` : 'no checks reported yet'}`);
     if (list.length && !pending.length) break;
     // a repository without CI never reports any: after a few minutes, there's nothing to wait for
     if (!list.length && io.now() - start >= firstMs) { io.log(`No checks reported on ${pr.url}: nothing to wait for.`); return 0; }
@@ -75,7 +93,7 @@ async function checks(branch, { waitMs = 30 * 60e3, pollMs = 30e3, firstMs = 3 *
   // each failed GitHub Actions run's failed steps, the end of their log; another CI's check, its link
   const runs = [...new Set(bad.map(c => (/\/actions\/runs\/(\d+)/.exec(c.link || '') || [])[1]).filter(Boolean))];
   for (const id of runs) {
-    const log = (io.ghText(['run', 'view', id, '--log-failed']) || '').split('\n');
+    const log = tidyLog(io.ghText(['run', 'view', id, '--log-failed']) || '').split('\n');
     io.log(untrusted(`${log.length > 150 ? '(the last 150 lines)\n' : ''}${log.slice(-150).join('\n') || '(no log)'}`, `the failed steps' log of CI run ${id}`));
   }
   for (const c of bad.filter(x => !/\/actions\/runs\/\d+/.test(x.link || ''))) io.log(`  ${c.name}: ${c.link || 'no link'} (not GitHub Actions: open it to see why)`);
@@ -94,7 +112,7 @@ function automerge(branch, main, cfg = settings(), io = IO) {
     io.log('Reviewers: solo, so auto-merge waits for your amk-ready label, which you add once you\'ve reviewed the pull request.');
     return 0;
   }
-  const pr = io.gh(['pr', 'view', branch, '--json', 'number,url,state,baseRefName,autoMergeRequest']);
+  const pr = io.gh(['pr', 'view', branch, '--json', 'number,url,state,baseRefName,autoMergeRequest,reviewDecision']);
   if (!pr) { io.log(`No pull request for ${branch} here, or gh isn't signed in.`); return 2; }
   if (pr.state !== 'OPEN') { io.log(`${pr.url} is ${pr.state.toLowerCase()}.`); return 0; }
   if (pr.baseRefName !== mainName(main)) {
@@ -102,6 +120,11 @@ function automerge(branch, main, cfg = settings(), io = IO) {
     return 0;
   }
   if (pr.autoMergeRequest) { io.log(`Auto-merge is on already for ${pr.url}.`); return 0; }
+  // GitHub gives no review decision where main requires no approval: there, auto-merge would merge without a person
+  if (!pr.reviewDecision) {
+    io.log(`${pr.url}: ${mainName(main)} requires no approval here, so auto-merge would merge it without a person's. It's left for a person to merge (to have the build turn auto-merge on, require an approval: docs/branch-protection.md in the kit).`);
+    return 0;
+  }
   const method = mergeMethod(cfg, io);
   const r = io.ghRun(['pr', 'merge', String(pr.number), '--auto', `--${method}`]);
   if (r.status === 0) { io.log(`Auto-merge on for ${pr.url} (${method}): it merges once a person approves and the checks pass.`); return 0; }
@@ -140,6 +163,8 @@ function settle(id) {
 function forward(main, { check = true } = {}, cfg = settings(), io = IO) {
   if (!main) { io.log('No main branch found: set AMK_BASE to the branch features start from.'); return 1; }
   if (git('status', '--porcelain', '--untracked-files=no')) { io.log('Commit the changes here first: merging main forward needs a clean folder.'); return 1; }
+  // a parent merged on GitHub since the last fetch counts
+  specs.fetchOrigin();
   const ref = specs.planRef();
   const plan = ref && specs.show(ref, 'specs/plan.md');
   if (!plan) return 0;
