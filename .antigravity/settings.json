@@ -12,11 +12,17 @@
       "write_file(package.json)"
     ],
     "deny": [
+      "command(git branch -D*)",
+      "command(git checkout -- .)",
+      "command(git checkout .)",
       "command(git clean -f*)",
       "command(git commit --no-verify*)",
       "command(git push --force*)",
       "command(git push -f*)",
       "command(git reset --hard*)",
+      "command(git restore .)",
+      "command(git stash clear*)",
+      "command(git stash drop*)",
       "command(rm -rf*)",
       "command(xcrun simctl erase*)",
       "read_file(**/*.jks)",

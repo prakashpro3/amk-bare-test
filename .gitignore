@@ -79,3 +79,10 @@ yarn-error.log
 
 # agentic-mobile-kit: secrets stay out of git; .ai/ holds local evidence (screenshots, logs)
 .ai/
+
+# agentic-mobile-kit: secrets stay out of git; .amk/ holds local evidence (screenshots, logs), .maestro/.amk-* the flows verify.sh is running
+!.env*.example
+!.env*.sample
+!.env*.template
+.amk/
+.maestro/.amk-*
