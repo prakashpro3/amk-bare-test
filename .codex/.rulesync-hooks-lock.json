@@ -4,12 +4,17 @@
     {
       "event": "PreToolUse",
       "matcher": "",
-      "identity": "command:node scripts/ai/guard.js"
+      "identity": "command:node -e \"require(require('child_process').execSync('git rev-parse --show-toplevel').toString().trim() + '/scripts/amk/guard.js')\""
+    },
+    {
+      "event": "SessionStart",
+      "matcher": "\"compact\"",
+      "identity": "command:node -e \"require(require('child_process').execSync('git rev-parse --show-toplevel').toString().trim() + '/scripts/amk/handoff-check.js')\""
     },
     {
       "event": "Stop",
       "matcher": "",
-      "identity": "command:node scripts/ai/handoff-check.js"
+      "identity": "command:node -e \"require(require('child_process').execSync('git rev-parse --show-toplevel').toString().trim() + '/scripts/amk/handoff-check.js')\""
     }
   ]
 }

@@ -2,7 +2,7 @@
 Status:        paused. Task 1 code and tests done; not done per AGENTS.md until iOS and Android builds are checked
 Done:          requirements, design and tasks approved; task 1 implemented in `App.tsx` ("Dark mode" row + `Switch` calling `Appearance.setColorScheme`) with tests in `__tests__/App.test.tsx`
 In progress:   nothing half-done in code; task 1 checkbox in tasks.md stays unticked until the builds are checked
-Next step:     "check against the spec": build iOS (`sh scripts/ai/ios-build.sh`) and Android (`cd android && ./gradlew assembleDebug`), check criteria 1-5 on screen, incl. design risk 1 (screen re-renders after toggling on both platforms)
+Next step:     "check against the spec": build iOS (`sh scripts/amk/ios-build.sh`) and Android (`cd android && ./gradlew assembleDebug`), check criteria 1-5 on screen, incl. design risk 1 (screen re-renders after toggling on both platforms)
 Decisions:     launch follows the system theme (criterion 2 final); Android Back-and-reopen is not a restart
 Open question: none
 Last verify:   2026-10-08 `yarn lint` exit 0, `yarn typecheck` exit 0, `yarn test` 3/3 passed

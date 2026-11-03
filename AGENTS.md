@@ -1,45 +1,70 @@
-<!-- KIT:START agentic-mobile-kit 0.4.0 (edit outside these markers; the kit updates what's inside) -->
+<!-- KIT:START agentic-mobile-kit 0.12.0 ci=github,codemagic stack=bare (edit outside these markers; the kit updates what's inside) -->
 # BareApp: instructions for AI agents
 
-Read by Claude Code (through CLAUDE.md), Codex, Cursor, OpenCode, Kiro and Antigravity. Keep it short; details live in `docs/ai/`.
+Read by Claude Code (through CLAUDE.md), Codex, Cursor, OpenCode, Kiro and Antigravity. Keep it short; details live in `docs/amk/`.
+
+This project may also use other AI workflow frameworks (for example Superpowers, BMAD or proAgents). They keep working for everything else. When the user starts a task with an `m-` skill (`/m-feature`, `$m-feature`, …), follow that skill's steps for the whole task; where another framework's instructions differ, the `m-` skill wins.
 
 ## Project
 
 - Bare React Native 0.87.1 (New Architecture), React 19.2.3, TypeScript 6.0.3, Node >= 22.11.0. Package manager: Yarn.
-- What the app does: `docs/ai/product.md`. Stack and services: `docs/ai/tech.md`. Folders and layers: `docs/ai/structure.md`. Code style: `docs/ai/conventions.md`.
+- Screens: phones (portrait only on iPhone, portrait and landscape on Android) and tablets (portrait and landscape). Build every screen for each of them (`docs/amk/react-native.md`, Tablets and landscape); `verify.sh` checks each one.
+- What the app does: `docs/amk/product.md`, and requirement by requirement, as it works now: `specs/current/`. Stack and services: `docs/amk/tech.md`. Folders and layers: `docs/amk/structure.md`. Code style: `docs/amk/conventions.md`.
+- The app's own words, to use in names, specs and messages: `docs/amk/glossary.md`.
+- How the app looks, which new screens follow (colours, type, spacing, controls): `docs/amk/design-system.md`.
 
 ## Commands
 
 | Task | Command |
 |---|---|
-| Install dependencies | `sh scripts/ai/install-deps.sh` |
+| Install dependencies | `sh scripts/amk/install-deps.sh` |
 | Lint, typecheck, test | `yarn lint`, `yarn typecheck`, `yarn test` |
-| iOS pods (after native dependency changes) | `cd ios && pod install` |
-| iOS build (simulator, no signing) | `sh scripts/ai/ios-build.sh` |
+| iOS pods (after native dependency changes) | `sh scripts/amk/pod-install.sh` |
+| iOS build (simulator, no signing) | `sh scripts/amk/ios-build.sh` |
 | Android build | `cd android && ./gradlew assembleDebug` |
-| Check on devices (release builds, Maestro flows, screenshots) | `sh scripts/ai/verify.sh all --spec <id>` |
-| Check a release before tagging it (versions, permission texts, debug leftovers) | `node scripts/ai/release-check.js` |
+| Check on devices (release builds, Maestro flows, screenshots) | `sh scripts/amk/verify.sh all --spec <id>`; with product flavors it checks the first unless `--flavor <name>`; another iOS scheme: `--scheme <name>`; only some screens: `--screens phone` (or `tablet`, `landscape`, …); only the flows tagged smoke: `--tags smoke`; on a real iPhone or iPad the user names: `AMK_IOS_DEVICE=<its UDID>` (the flows clear the app's data on it) |
+| Check devices at the same time | `sh scripts/amk/verify.sh plan --spec <id>` prints a command per device that fits in memory (in rounds, or a device's flows in parts), each for an `m-device-checker` subagent |
+| After each task: lint, typecheck and the tests of the changed files | `sh scripts/amk/verify.sh quick --related` |
+| React Native mistakes, flow problems, and files or functions over the size limits, in this branch's changes (`verify.sh quick` runs it) | `node scripts/amk/rn-check.js` |
+| Specs: progress (the plan's features too), format, the tests of the areas a spec touches, a flow to start from, merging into the living spec; the plan's check, a second folder to plan in, a CSV or Trello export to plan from, and starting a planned feature | `node scripts/amk/specs.js status` (or `check`, `tests <id>`, `flow <id>`, `merge <id>`, `check --plan`, `plan-folder`, `import <file>`, `start [<id>]`) |
+| Build the approved planned features without anyone watching (a person starts it; it never skips permission prompts) | `node scripts/amk/autopilot.js [--wait <hours>]`; first `node scripts/amk/autopilot.js check` |
+| A feature's pull request: wait for its checks (a failure's log follows), its review comments, auto-merge for a team, and main merged into stacked branches | `node scripts/amk/pr.js checks` (or `comments`, `automerge`, `forward`) |
+| Check a release before tagging it (versions, permission texts, store review rules, debug leftovers) | `node scripts/amk/release-check.js` |
+| Signed release builds (a person runs them: they use the signing keys) | `sh scripts/amk/release-build.sh android [flavor]`, `sh scripts/amk/release-build.sh ios [scheme]` |
 
 ## Definition of done
 
 A task is done only when:
-1. lint, typecheck and tests pass, and you show the command output from this session;
-2. UI changes were checked with `sh scripts/ai/verify.sh all --spec <id>` on both iOS and Android, and you looked at the screenshots;
+1. `sh scripts/amk/verify.sh quick` passes (lint, typecheck, tests) and you show its output from this session. In an app whose base branch already fails some of them, it passes when your change adds no new failure, and lists the old ones: leave those alone unless the task is to fix them;
+2. UI changes were checked with `sh scripts/amk/verify.sh all --spec <id>` on both iOS and Android, on each screen listed above, and you looked at the screenshots. On Windows or Linux it covers Android only: say in `progress.md` and the PR that iOS still needs a Mac, and don't merge until a teammate has checked it;
 3. the change stays inside the task's scope;
-4. `specs/<id>/progress.md` is updated, when working from a spec.
+4. `specs/<id>/progress.md` is updated, when working from a spec;
+5. tests are assessed (added, changed or retired, or why none), the flows of the areas it touches ran, and what didn't run is listed with its reason, in `specs/<id>/test-report.md` (`m-test`).
 
 Never say a check passed unless you ran it in this session.
 
 ## Rules
 
 - Stay inside the task. Ask before touching unrelated files.
+- Ask the user in rounds: every question you can ask now, each with the answer you recommend. With a question tool (`AskUserQuestion`, `request_user_input`, `question`), give each 2 to 4 options, the recommended one first and marked "(Recommended)", multiple choice where several can apply; suggestions too. Without one, number them, each worded so "yes" takes it. An approval is always a question of its own, never part of a round. The answers can open the next round. Look facts up in the code yourself; ask only for decisions. A question only someone else can answer (the client, a designer, the backend team) goes into `specs/<id>/questions-<who>.md` for the user to send; go on with the rest.
+- Before designing a feature's screens, ask the user which UI/UX level they want: Simple (the default), Mixed or Premium (`specs/_templates/design.md` describes each). Build them to it.
 - Ask before adding or upgrading dependencies, and before editing `package.json`, lockfiles, `Podfile`, `build.gradle`, `Info.plist`, `AndroidManifest.xml` or `.github/workflows/`.
 - Don't hand-edit `ios/*.xcodeproj/project.pbxproj`. If a native file must be added to the Xcode project, stop and ask.
-- Never read, print or commit `.env` files, keystores or signing files. Secrets don't belong in this repo.
-- Never use `git commit --no-verify`, `git push --force`, `git reset --hard` or `rm -rf`.
+- Never read, print or commit `.env` files, keystores, signing files or the files `.amk-secrets` lists. Secrets don't belong in this repo.
+- Never use `git commit --no-verify`, `git push --force`, `git reset --hard` or `rm -rf`, and never throw away work that can't be brought back (uncommitted changes with `git checkout .` or `git restore .`, stashes with `git stash drop` or `clear`, unmerged commits with `git branch -D`): ask first. To undo your own edit to a file, `git checkout -- <that file>`.
+- When `rn-check` (in `verify.sh quick`) reports a problem (✗), show it to the user and let them choose, for each one: fix it, or keep the line with `// amk-ok <today's date>: <their reason>`. Never add an `amk-ok`, or a cap in `.amk-size-caps`, on your own. One kept over two weeks ago comes back when its file changes: ask again. Fix the warnings (!) in code the task changed, or tell the user why one stays.
+- Run shell commands one at a time, as the skills write them, not joined with `&&` or `;`: a tool asks about a joined line, or refuses it, as a whole. When one is refused, run its parts on their own before deciding anything is blocked.
 - After 2 failed attempts at the same fix, stop and report what you found.
-- Chat is not memory: write decisions into the spec or `docs/ai/decisions.md` straight away.
-- Follow `docs/ai/react-native.md`. Before fixing a build error, check `docs/ai/known-issues.md`.
+- Chat is not memory: write decisions into the spec or `docs/amk/decisions.md` straight away.
+- Follow `docs/amk/react-native.md`. Before fixing a build error, check `docs/amk/known-issues.md`.
+
+## Review guidelines
+
+Reviews, AI reviewers' too, check these first (more in `m-review`):
+- No secrets or personal data in code, logs or analytics; tokens only in the Keychain or Keystore.
+- Nothing lost: older saved data still loads, and typed input survives errors, going offline and a restart.
+- The code does what its spec says, on both platforms and each screen listed above, and its tests changed with it.
+<!-- This app's own, a line each. -->
 
 ## Skills
 

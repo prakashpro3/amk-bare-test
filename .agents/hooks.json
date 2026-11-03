@@ -5,19 +5,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node scripts/ai/guard.js"
+            "command": "node -e \"require(require('child_process').execSync('git rev-parse --show-toplevel').toString().trim() + '/scripts/amk/guard.js')\""
           }
         ]
       }
     ],
     "Stop": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node scripts/ai/handoff-check.js"
-          }
-        ]
+        "type": "command",
+        "command": "node -e \"require(require('child_process').execSync('git rev-parse --show-toplevel').toString().trim() + '/scripts/amk/handoff-check.js')\""
       }
     ]
   }

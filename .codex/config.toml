@@ -25,3 +25,7 @@ glob_scan_max_depth = 8
 "**/AndroidManifest.xml" = "deny"
 ".github/workflows/**" = "read"
 ".git/**" = "write"
+
+# agentic-mobile-kit: questions as options to pick from, in every mode
+[features]
+default_mode_request_user_input = true

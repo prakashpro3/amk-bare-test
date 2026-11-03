@@ -1,0 +1,1203 @@
+#!/bin/sh
+# Checks the app the way a user would: lint, typecheck and tests, then release builds on the iOS simulator
+# and Android emulator, running Maestro flows and saving screenshots as evidence. Apps that support tablets or
+# landscape (scripts/amk/screens.js) are checked on each: an iPad simulator and a tablet emulator, and turned.
+#
+# Usage: sh scripts/amk/verify.sh [quick|ios|android|all|build|plan|approve] [--spec <ids>] [--flow <file>] [--label <name>]
+#                                [--flavor <name>] [--scheme <name>] [--screens <list>] [--no-build] [--related]
+#   quick           lint, typecheck, tests
+#   --related       quick: only the Jest tests related to the files this branch changed, for each task while building
+#                   (without it, the whole suite)
+#   ios|android     release build, install, run flows, screenshots
+#   all             everything (default)
+#   build           the release builds only, iOS and Android at the same time, for --no-build checks after it
+#   plan            how many devices this machine's memory can check at the same time, and the commands to run:
+#                   one per device, in rounds when they don't all fit, the flows split into parts when there's room
+#   approve         the last check's screenshots (of --spec or --label) become the approved ones, in .amk/approved/:
+#                   after each device check, the screenshots that differ from them are listed, for a look
+#   --spec <ids>    run .maestro/<id>*.yaml and save evidence in .amk/evidence/<id>/. Several, comma-separated, run the
+#                   flows of each (a flow's name prefix works too: offline-sync runs offline-sync-1.yaml) and need --label
+#   --flow <file>   run only this flow: a path in the project, or anywhere (an absolute path)
+#   --tags <list>   only the flows with one of these tags in their header (tags: [smoke]), comma-separated
+#   --label <n>     evidence folder name (default: the spec id, or no-spec)
+#   --flavor <name> Android product flavor to check (default: the first one in build.gradle)
+#   --scheme <name> iOS scheme to check (default: the one named like the workspace)
+#   --screens <l>   only these of the screens the app supports, comma-separated: phone, tablet, portrait,
+#                   landscape, or one such as tablet-landscape
+#   --no-build      check the last build instead of building again (after `build`)
+#   --part <k/n>    only part k of the flows split in n (every n-th, from the k-th), with its evidence in
+#                   <screen>/part-k/: part 1 on the usual device, the others on a temporary copy of it (the same kind of
+#                   simulator, or an emulator with the same settings), deleted afterwards. plan prints these
+#   (no flows found: a smoke check that launches the app and takes a screenshot)
+#   A flow that fails runs once more: one that passes then is flaky, which doesn't fail the check but is reported, with
+#   the first try's log and screen kept in maestro-logs/<screen>-<flow>-first-try/
+#   Before a build it stops when the disk has under 5 GB free, or 8 GB before a first iOS build (not in CI), as a build that
+#   runs out halfway wastes the run
+#   Evidence per screen: ios/ and android/ (phone, portrait), then -landscape/, -tablet/ and -tablet-landscape/, each
+#   with its latest run only (the device's own log only for a flow that failed); the newest 5 evidence folders stay,
+#   and every prototype's
+# Env: AMK_ANDROID_FLAVOR, AMK_IOS_SCHEME, AMK_SCREENS (defaults for the options), AMK_IOS_DEVICE (simulator name
+#      or UDID, or a connected iPhone's or iPad's: the only way to check on one, whose app data the flows clear),
+#      AMK_ANDROID_DEVICE (adb serial: the only way to check on a phone, whose app data the flows clear),
+#      AMK_ANDROID_AVD (the emulator to use, started if it isn't running; other devices are left alone),
+#      AMK_IOS_TABLET (iPad simulator, or a connected iPad: name or UDID), AMK_ANDROID_TABLET_AVD (tablet emulator),
+#      AMK_ANDROID_TABLET (serial), AMK_IOS_TEAM (the Apple team ID that signs builds for real iPhones and iPads;
+#      default: the project's), AMK_PARALLEL (1 or 0: overrides plan's choice), AMK_MEMORY_GB (the memory plan
+#      counts on: this machine's; less when other emulators stay open), AMK_DISK_GB (the free disk it counts on: this
+#      folder's), AMK_A11Y (0: no view-tree steps on Android, so no accessibility warnings. The steps go in a copy
+#      of each flow, .maestro/.amk-<screen>-<flow>.yaml, where ${MAESTRO_FILENAME} is the copy's name),
+#      AMK_DEVICES (how many devices plan checks at once: one per 6 GB beyond 4), AMK_DEVICE_WAIT (minutes to wait for a
+#      device in use, 30), AMK_LOCK_DIR (where runs on this machine claim devices; /tmp/agentic-mobile-kit-<user id>),
+#      AMK_EVIDENCE_KEEP (how many evidence folders stay, newest first: 5; 0 keeps them all; a prototype's and those of a
+#      spec in progress always stay)
+# A device in use by another run (any project on this machine) is skipped for a free one of the same kind, or waited
+# for when it was named or none is free.
+# Real iPhones and iPads (iOS 17 or later): Maestro doesn't run on them, so their flows run through maestro-runner, with
+# WebDriverAgent signed by the same team. The app is opened once first, and crash reports it leaves join the evidence.
+# Flows that log in read ${MAESTRO_EMAIL} and the like from a local, gitignored .maestro/.env.local (never committed).
+set -eu
+
+mode=${1:-all}
+[ $# -gt 0 ] && shift
+args=$* # for the commands plan prints
+spec=""
+flow=""
+tags=""
+label=""
+flavor=${AMK_ANDROID_FLAVOR:-}
+only=${AMK_SCREENS:-}
+no_build=0
+related=0
+build_only=0
+part=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --spec) spec=$2; shift 2 ;;
+    --flow) flow=$2; shift 2 ;;
+    --tags) tags=$2; shift 2 ;;
+    --label) label=$2; shift 2 ;;
+    --flavor) flavor=$2; shift 2 ;;
+    --scheme) AMK_IOS_SCHEME=$2; export AMK_IOS_SCHEME; shift 2 ;;
+    --screens) only=$2; shift 2 ;;
+    --no-build) no_build=1; shift ;;
+    --related) related=1; shift ;;
+    --part) part=$2; shift 2 ;;
+    *) echo "verify: unknown option $1"; exit 2 ;;
+  esac
+done
+part_k=1 part_n=1
+if [ -n "$part" ]; then
+  part_k=${part%/*} part_n=${part#*/}
+  case $part in */*) ;; *) part_k=x ;; esac
+  case "$part_k$part_n" in '' | *[!0-9]*) echo "verify: --part takes k/n, such as 2/3"; exit 2 ;; esac
+  [ "$part_k" -ge 1 ] && [ "$part_k" -le "$part_n" ] || { echo "verify: --part takes k/n, such as 2/3"; exit 2; }
+fi
+
+# several specs' flows go in one evidence folder, which the cleanup below keeps by its name
+case $spec in *,*) [ -n "$label" ] || { echo "verify: --spec $spec runs several specs' flows: name their evidence folder with --label <name>"; exit 2; } ;; esac
+
+root=$(pwd)
+# --flow: a path in the project, or an absolute one (C:/… on Windows too); a Windows path's backslashes become slashes
+case $flow in *\\*) flow=$(printf '%s' "$flow" | tr '\\' /) ;; esac
+case $flow in "" | /* | [A-Za-z]:/*) ;; *) flow=$root/$flow ;; esac
+[ -z "$flow" ] || [ -f "$flow" ] || { echo "verify: no flow file $flow"; exit 2; }
+. scripts/amk/maestro-env.sh
+# runs without a spec or a label (verify.sh quick, mostly) share one folder, so they don't push out a feature's
+evidence="$root/.amk/evidence/${label:-${spec:-no-spec}}"
+mkdir -p "$evidence"
+# Evidence stays on this machine (.amk/ is out of git): the newest AMK_EVIDENCE_KEEP folders stay, this one among
+# them, and older ones go (5; 0 keeps them all). A prototype's folder (<id>-prototype, material for a demo) and those
+# of a spec in progress (its progress.md isn't done: its evidence table points there) always stay and aren't counted.
+# Kits before 0.7.12 gave each run without a spec a folder named after its time: those go first
+touch "$evidence"
+keep=${AMK_EVIDENCE_KEEP:-5}
+if [ "$keep" -gt 0 ] 2> /dev/null; then
+  open=$(for p in "$root"/specs/*/progress.md; do
+    case $p in (*/specs/_templates/* | */specs/current/*) continue ;; esac
+    if [ -f "$p" ] && ! grep -qi -E '^Status:[[:space:]]*done' "$p"; then basename "$(dirname "$p")"; fi
+  done)
+  all=$(ls -dt "$root"/.amk/evidence/*/ 2> /dev/null | grep -v -- '-prototype/$' | while IFS= read -r d; do
+    for s in $open; do case $(basename "$d") in ("$s" | "$s"-*) continue 2 ;; esac; done
+    echo "$d"
+  done)
+  timed='/[0-9]{8}-[0-9]{6}/$'
+  old=$({ echo "$all" | grep -v -E "$timed" || true; echo "$all" | grep -E "$timed" || true; } | grep . | tail -n +$((keep + 1)))
+  if [ -n "$old" ]; then
+    # another run on this machine (a part, a round) may have just removed the same folder
+    echo "$old" | while IFS= read -r d; do rm -r "${d:?}" 2> /dev/null || true; done
+    echo "evidence: removed $(echo "$old" | awk -F/ 'NR <= 5 { s = s (NR > 1 ? ", " : "") $(NF - 1) } END { print s (NR > 5 ? " and " NR - 5 " more" : "") }') from .amk/evidence, keeping the newest $keep and those of specs in progress (AMK_EVIDENCE_KEEP sets how many; 0 keeps them all)"
+  fi
+fi
+status=0
+
+flow_files() {
+  {
+    if [ -n "$flow" ]; then echo "$flow"
+    elif [ -n "$spec" ]; then
+      for s in $(echo "$spec" | tr ',' ' '); do find "$root/.maestro" -maxdepth 1 -iname "$s*.yaml" ! -name '.amk-*' 2>/dev/null; done | sort -u
+    else find "$root/.maestro" -maxdepth 1 -name '*.yaml' ! -name '.amk-*' 2>/dev/null | sort
+    fi
+  } | with_tags | awk -v k="$part_k" -v n="$part_n" '(NR - 1) % n == k - 1'
+}
+# the flows (a path a line) with one of --tags in their header: tags: [smoke, login], or one tag a line below tags:
+with_tags() {
+  if [ -z "$tags" ]; then cat; return; fi
+  TAGS=$tags node -e '
+    const fs = require("fs");
+    const { tagsOf } = require("./scripts/amk/specs.js");
+    const want = process.env.TAGS.split(",").map(s => s.trim()).filter(Boolean);
+    for (const f of fs.readFileSync(0, "utf8").split("\n").filter(Boolean)) {
+      const tags = tagsOf(fs.readFileSync(f, "utf8"));
+      if (tags.some(s => want.includes(s))) console.log(f);
+    }'
+}
+
+# the screens to check on a platform: the ones the app supports, narrowed by --screens
+screens_for() {
+  for s in $(node scripts/amk/screens.js "$1"); do
+    [ -n "$only" ] || { echo "$s"; continue; }
+    for w in $(echo "$only" | tr ',' ' '); do
+      case $s in "$w" | "$w"-* | *-"$w") echo "$s"; break ;; esac
+    done
+  done
+}
+
+# Maestro's version (the first lines may be an update notice), and whether it's at least $1
+maestro_version() { maestro --version 2> /dev/null | tail -n 1 | tr -d '\r '; }
+maestro_at_least() { [ "$(printf '%s\n%s\n' "$1" "$(maestro_version)" | sort -V | head -n 1)" = "$1" ]; }
+
+# Locks shared by every project and agent on this machine, so two runs never use one device (or build one project)
+# at once: a run claims a device by creating a folder named after it, and gives it back when it's done with it. A
+# claim whose run ended without giving it back is taken over.
+locks=${AMK_LOCK_DIR:-/tmp/agentic-mobile-kit-$(id -u 2> /dev/null || echo 0)}
+mkdir -p "$locks" 2> /dev/null || true
+project=$(printf %s "$root" | cksum | cut -d ' ' -f 1)
+held=""
+lock_path() { echo "$locks/$(printf %s "$1" | tr -c 'A-Za-z0-9._-' _)"; }
+# whether a Maestro run started outside the kit is using device $1 (its command line names the device)
+maestro_on() { ps -ax -o command 2> /dev/null | grep -E -- "--(device|udid)[ =]$1( |$)" | grep -q maestro; }
+# claims $1 for this run; with a device ID in $2, also when no other Maestro run is using that device
+claim() {
+  l=$(lock_path "$1")
+  if mkdir "$l" 2> /dev/null; then
+    printf '%s\n%s\n%s\n' "$$" "$(basename "$root") (${label:-${spec:-$mode}})" "$(date +%H:%M)" > "$l/owner"
+    held="$held $l"
+    if [ -n "${2:-}" ] && maestro_on "$2"; then unclaim "$1"; return 1; fi
+    return 0
+  fi
+  owner=$(sed -n 1p "$l/owner" 2> /dev/null || true)
+  [ "$owner" != "$$" ] || return 0 # this run holds it already
+  # its run ended, or was stopped before it could say who it was
+  if { [ -n "$owner" ] && ! kill -0 "$owner" 2> /dev/null; } || { [ -z "$owner" ] && [ -n "$(find "$l" -maxdepth 0 -mmin +1 2> /dev/null)" ]; }; then
+    rm -f "$l/owner"
+    rmdir "$l" 2> /dev/null && { claim "$@"; return; }
+  fi
+  return 1
+}
+unclaim() { l=$(lock_path "$1"); rm -f "$l/owner"; rmdir "$l" 2> /dev/null || true; held=$(echo "$held" | sed "s| $l||"); }
+release() { for l in $held; do rm -f "$l/owner"; rmdir "$l" 2> /dev/null || true; done; held=""; }
+temps="" # the temporary devices this run made for a part of the flows (--part), deleted at its end
+tree_flow="" # the copy of a flow with view-tree steps (Android), next to it while it runs
+trap 'release; drop_temps; [ -z "$tree_flow" ] || rm -f "$tree_flow"' EXIT
+trap 'exit 130' INT TERM
+holder() {
+  l=$(lock_path "$1")
+  if [ -f "$l/owner" ]; then echo "$(sed -n 2p "$l/owner") since $(sed -n 3p "$l/owner")"; else echo "another Maestro run"; fi
+}
+# claims $1 as claim does, waiting while it's in use (AMK_DEVICE_WAIT minutes, 30 by default); $3 names it in messages
+claim_wait() {
+  claim "$1" "${2:-}" && return 0
+  echo "  waiting for $3: in use by $(holder "$1")"
+  waited=0
+  until claim "$1" "${2:-}"; do
+    [ "$waited" -lt $((${AMK_DEVICE_WAIT:-30} * 60)) ] || { echo "  gave up waiting for $3 after ${AMK_DEVICE_WAIT:-30} minutes"; return 1; }
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+run_flow() { # screen device app_id file name orientation
+  # Maestro's own logs, which have errors its output leaves out: of this flow's latest run only (each run adds a folder
+  # of its own), as an earlier run's screenshots aren't this run's evidence
+  debug="$evidence/maestro-logs/$1-$5"
+  [ ! -d "$debug" ] || rm -r "$debug"
+  mkdir -p "$debug" "$out/screenshots"
+  target=$4
+  # Android: after each screenshot, Maestro saves the screen's view tree (an optional step that can't pass, half a
+  # second), from which a11y.js lists tappable elements without a label or under 48 dp. Maestro runs a copy of the flow
+  # with those steps, next to it so its subflows' paths still work, deleted after. AMK_A11Y=0 turns it off
+  tree_flow=""
+  if [ "${1%%-*}" = android ] && [ "${AMK_A11Y:-1}" != 0 ]; then
+    tree_flow=$(dirname "$4")/.amk-$1-$5.yaml
+    with_trees "$4" > "$tree_flow"
+    target=$tree_flow
+  fi
+  # Maestro reads the path in the flows below itself, so it's a native path (a Windows path in Git Bash)
+  native=$(cd "$(dirname "$target")" && { pwd -W 2> /dev/null || pwd; })/$(basename "$target")
+  if is_real "$2"; then
+    # on a real device every flow runs inside one, first: the first launchApp maestro-runner finds in a flow decides
+    # whether it answers alerts itself, and for most it does (for permission prompts, which it can't allow ahead),
+    # pressing the last button of the app's own alerts too, such as a Delete. Maestro never answers an app's alerts.
+    # So one that says to leave permissions alone comes first, where it never runs (on Android only)
+    on_complete="" turn=""
+    # what's beside the flow, and below it in the project (its subflows): only beside it, for a flow outside the
+    # project, whose folder may hold anything
+    case $4 in "$root"/*) depth="" ;; *) depth="-maxdepth 1" ;; esac
+    # a flow that turns airplane mode on and fails before turning it off leaves the device offline, and an offline
+    # device doesn't open a development-signed app: every later flow would fail as if the team weren't trusted.
+    # maestro-runner runs this one's onFlowComplete, not the flow's own. It looks for the switch on Settings' main page,
+    # but Settings opens on the page it was last left on: restarted, it opens on its main page (for the flow's own
+    # setAirplaneMode too). Optional, so a flow that passed never fails here. A few seconds, so only where flows use it
+    if find "$(dirname "$4")" $depth \( -path "$root/.amk" -o -name node_modules \) -prune -o \( -name '*.yaml' -o -name '*.yml' \) \
+      -exec grep -qs setAirplaneMode {} \; -print | grep -q .; then
+      xcrun devicectl device process launch --device "$2" --terminate-existing com.apple.Preferences > /dev/null 2>&1 || true
+      on_complete='  - setAirplaneMode:\n      value: disabled\n      optional: true\n'
+    fi
+    if [ "$6" != PORTRAIT ]; then
+      # WebDriverAgent turns the device, then fails the step unless the app in front turned too: here the home
+      # screen, which most iPhones never turn. Whether the app turned shows in its screenshots. It knows
+      # LANDSCAPE_LEFT only as "landscape"
+      on_complete="$on_complete"'  - setOrientation:\n      orientation: PORTRAIT\n      optional: true\n'
+      turn='- setOrientation:\n    orientation: landscape\n    optional: true\n'
+    fi
+    [ -z "$on_complete" ] || on_complete="onFlowComplete:\n$on_complete"
+    printf "appId: %s\n${on_complete}---\n- runFlow:\n    when:\n      platform: Android\n    commands:\n      - launchApp:\n          permissions:\n            all: unset\n${turn}- runFlow: '%s'\n" "$3" "$native" > "$debug/screen.yaml"
+    target=$debug/screen.yaml
+  elif [ "$6" != PORTRAIT ]; then
+    # a turned screen: the flow runs inside one that turns the device first and back to portrait after
+    printf "appId: %s\nonFlowComplete:\n  - setOrientation: PORTRAIT\n---\n- setOrientation: %s\n- runFlow: '%s'\n" "$3" "$6" "$native" > "$debug/screen.yaml"
+    target=$debug/screen.yaml
+  fi
+  rc=0
+  if is_real "$2"; then
+    # it also saves each named screenshot next to its flow file: the ones it makes there move to its log folder, so
+    # the project stays as it was (they're in its report too)
+    pngs() { find "$(dirname "$4")" $depth \( -path "$root/.amk" -o -name node_modules \) -prune -o -name '*.png' -print | sort; }
+    pngs "$@" > "$debug/.pngs"
+    # with the app's build: on a real device, clearState installs the app again
+    MAESTRO_RUNNER_NO_TELEMETRY=1 DO_NOT_TRACK=1 npx -y "$runner" --platform ios --driver wda --device "$2" \
+      --team-id "$team" --wda-bundle-id "$3.wda" --app-file "$device_app" test -e APP_ID="$3" \
+      -e ORIENTATION="$([ "$6" = PORTRAIT ] && echo PORTRAIT || echo landscape)" --output "$debug" \
+      --flatten "$target" > "$out/$5.log" 2>&1 || rc=$?
+    pngs "$@" | comm -13 "$debug/.pngs" - | while IFS= read -r f; do mv "$f" "$debug/"; done
+    # its takeScreenshot files, not the ones of a step that failed (<step>-after.png)
+    find "$debug" -path '*/assets/*.png' ! -name '*-[0-9][0-9][0-9]-after.png' -exec cp {} "$out/screenshots/" \;
+    return $rc
+  fi
+  # screenshots use relative names: older Maestro saves them in the current folder, then in --test-output-dir, and
+  # from 2.7 in the debug output under <flow>/takeScreenshot/, from where they join the screen's evidence
+  # ORIENTATION: how this screen turned the device, for a flow to turn it back after another app's portrait-only screen
+  # (a call, the camera) turned it
+  (cd "$out" && maestro --device "$2" test --test-output-dir "$out" --debug-output "$debug" --flatten-debug-output \
+    -e APP_ID="$3" -e ORIENTATION="$6" "$target" > "$out/$5.log" 2>&1) || rc=$?
+  find "$debug" -path '*/takeScreenshot/*.png' -exec cp {} "$out/screenshots/" \;
+  if [ -n "$tree_flow" ]; then
+    rm -f "$tree_flow"
+    tree_flow=""
+    # Maestro named the flow's folder after the copy, a hidden name: the flow's own, as on iOS
+    [ ! -d "$debug/.amk-$1-$5" ] || [ -e "$debug/$5" ] || mv "$debug/.amk-$1-$5" "$debug/$5"
+    # a flow run again replaces its lines from the earlier try
+    { awk -F '\t' -v f="$5" '$1 != f' "$out/.a11y"; node scripts/amk/a11y.js "$debug" "$density" "$5" 2> /dev/null || true; } > "$out/.a11y.new"
+    mv "$out/.a11y.new" "$out/.a11y"
+  fi
+  return $rc
+}
+
+# whether a flow failed because the Android device dropped out: Maestro says so in its own log or the flow's ($1)
+lost_device() {
+  grep -qs -E 'device offline|DeviceServerDiedException|Device server died' "$debug/maestro.log" ||
+    grep -qs -E 'was requested, but it is not connected|Device server died' "$1"
+}
+# waits until the Android device $1 answers three times in a row, 10 seconds apart (3 minutes at most)
+steady() {
+  "$adb" reconnect offline > /dev/null 2>&1 || true
+  in_row=0 tries=0
+  while [ "$in_row" -lt 3 ] && [ "$tries" -lt 18 ]; do
+    tries=$((tries + 1))
+    if [ "$("$adb" -s "$1" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; then in_row=$((in_row + 1)); else in_row=0; "$adb" reconnect offline > /dev/null 2>&1 || true; fi
+    [ "$in_row" -ge 3 ] || sleep 10
+  done
+}
+# why flow $2 failed on the device $1, in a line: the step and what Maestro said (on a real device, maestro-runner's report)
+why_failed() {
+  if is_real "$1"; then
+    node -e 'try { const e = ((JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).flows || [])[0] || {}).error;
+      if (e) console.log(`with: ${e.split("\n")[0]}`); } catch {}' "$debug/report.json"
+  else
+    # the first step that failed is the innermost; Maestro's message comes after the subflows that failed around it
+    # (Run <subflow>... FAILED) and the steps onFlowComplete ran
+    awk '/\.\.\. FAILED[[:space:]]*$/ { step = $0; sub(/\.\.\. FAILED[[:space:]]*$/, "", step); sub(/^[[:space:]]+/, "", step)
+      said = ""
+      while ((getline line) > 0) if (line ~ /[^[:space:]]/ && line !~ /\.\.\. [A-Z]+[[:space:]]*$/) { said = line; break }
+      sub(/^[[:space:]]+/, "", said)
+      printf "at \"%s\"%s\n", step, (said == "" ? "" : ": " said); exit }' "$out/$2.log"
+  fi
+}
+# the screen when a flow failed on the device $1: the last screenshot of a failing step (Maestro's, or maestro-runner's),
+# not one of the view-tree steps', which Maestro takes too
+failure_shot() {
+  if is_real "$1"; then find "$debug" -name '*-after.png' | sort | tail -n 1
+  else find "$debug" -path '*/screenshots/*.png' ! -name '*amk-view-tree*' | sort | tail -n 1; fi
+}
+# flow $1 with a step after each screenshot (takeScreenshot: <name>) that makes Maestro save the screen's view tree,
+# named after the screenshot: it waits 1 ms for an element that isn't there, and doesn't fail the flow
+with_trees() {
+  awk '{ print }
+    /^[[:space:]]*-[[:space:]]*takeScreenshot:[[:space:]]*[^[:space:]#]/ {
+      match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH)
+      name = $0; sub(/^[[:space:]]*-[[:space:]]*takeScreenshot:[[:space:]]*/, "", name); sub(/[[:space:]]+#.*$/, "", name)
+      sub(/[[:space:]]+$/, "", name) # and a Windows line end
+      gsub(/["\047]/, "", name); gsub(/[^A-Za-z0-9_-]/, "-", name)
+      printf "%s- extendedWaitUntil:\n%s    visible:\n%s      id: \"amk-view-tree-%s\"\n%s    timeout: 1\n%s    optional: true\n", ind, ind, ind, name, ind, ind
+    }' "$1"
+}
+run_flows() { # screen device app_id orientation (PORTRAIT, or LANDSCAPE_LEFT to turn it) [again]
+  out="$evidence/$1"
+  # a part of the flows has a folder of its own in the screen's, as the parts run at the same time: part 1 clears what
+  # an earlier run left beside them
+  if [ -n "$part" ]; then
+    if [ "$part_k" = 1 ] && [ -z "${5:-}" ] && [ -d "$out" ]; then
+      for e in "$out"/* "$out"/.[!.]*; do
+        [ -e "$e" ] || continue
+        case ${e##*/} in part-*) [ "${e##*/part-}" -le "$part_n" ] 2> /dev/null && continue ;; esac
+        rm -r "$e"
+      done
+    fi
+    out="$out/part-$part_k"
+  fi
+  # the screen's latest run only: an earlier run's screenshots aren't this run's evidence
+  [ -n "${5:-}" ] || [ ! -d "$out" ] || rm -r "$out"
+  mkdir -p "$out"
+  # this run's screenshots are the ones newer than this; the status before it, for running the screen again
+  : > "$out/.started"
+  # each flow's result, and what the view trees showed (Android), for the report
+  : > "$out/.flows"
+  : > "$out/.a11y"
+  [ "${1%%-*}" != android ] || density=$(device_density "$2")
+  [ -n "${5:-}" ] || before=$status
+  files=$(flow_files)
+  if [ -z "$files" ]; then
+    [ -z "$tags" ] || echo "  $1: no flow has the tag $tags, so this is a check that the app opens"
+    # launchApp returns before the app has drawn, and a splash screen stays up until the JavaScript has loaded:
+    # a fixed wait (for text that never appears), then for the screen to settle, so the screenshot shows the app
+    printf 'appId: %s\n---\n- launchApp\n- extendedWaitUntil:\n    visible: "agentic-mobile-kit: waiting for the app to draw"\n    timeout: 5000\n    optional: true\n- waitForAnimationToEnd\n- takeScreenshot: smoke-launch\n' "$3" > "$out/smoke.yaml"
+    files="$out/smoke.yaml"
+  fi
+  passed=0
+  total=0
+  flakies=0
+  for f in $files; do
+    total=$((total + 1))
+    name=$(basename "$f" .yaml)
+    ok=0 why="" shot="" first=""
+    # an earlier run's first try, when the flow was flaky then
+    [ ! -d "$evidence/maestro-logs/$1-$name-first-try" ] || rm -r "$evidence/maestro-logs/$1-$name-first-try"
+    : > "$out/.flow-started"
+    run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+    # Maestro now and then stops before a flow starts (it printed nothing), and an emulator sometimes drops its adb
+    # connection for a moment: run the flow once more (after reconnecting)
+    if [ "$ok" != 0 ] && [ ! -s "$out/$name.log" ]; then
+      echo "  $1: Maestro stopped before flow $name started; running it once more"
+      ok=0
+      run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+    # (or missed it as it started, or Maestro's server on it died: an emulator under load, with other devices starting
+    # or running on this machine, can drop it for a few minutes). Once it answers steadily, run it again, twice at most
+    elif [ "$ok" != 0 ] && [ "${1%%-*}" = android ] && lost_device "$out/$name.log"; then
+      again=0
+      while [ "$ok" != 0 ] && [ "$again" -lt 2 ] && lost_device "$out/$name.log"; do
+        again=$((again + 1))
+        echo "  $1: the device went offline during flow $name; running it once more when it answers steadily"
+        steady "$2"
+        ok=0
+        run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+      done
+    elif [ "$ok" != 0 ] && is_real "$2" && grep -qs 'explicitly trusted' "$out/$name.log"; then
+      # as launch_check found it does: here after clearState installed the app again, which it opened a moment later
+      echo "  $1: the device didn't open the app it had just installed again; running flow $name once more"
+      sleep 15
+      ok=0
+      run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+    elif [ "$ok" != 0 ] && ! is_real "$2" && ! grep -qE '\.\.\. *(COMPLETED|FAILED|SKIPPED|WARNED)' "$out/$name.log"; then
+      # nor did it get to the flow's first step when its driver didn't start on the device (a stack trace, and no step)
+      echo "  $1: Maestro stopped before flow $name started; running it once more"
+      ok=0
+      run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+    elif [ "$ok" != 0 ]; then
+      # one that failed at one of its steps runs once more, to tell a flaky flow from a failing one. The first try's logs
+      # and screen stay as the evidence of a flaky one
+      why=$(why_failed "$2" "$name" | tr '\t' ' ')
+      shot=$(failure_shot "$2")
+      first=$debug-first-try
+      [ ! -d "$first" ] || rm -r "$first"
+      mv "$debug" "$first"
+      mv "$out/$name.log" "$first/flow.log"
+      [ -z "$shot" ] || shot=$first${shot#"$debug"}
+      echo "  $1: flow $name failed; running it once more, to tell a flaky flow from a failing one"
+      ok=0
+      run_flow "$1" "$2" "$3" "$f" "$name" "$4" || ok=$?
+      if [ "$ok" != 0 ]; then rm -r "$first"; first="" why="" shot=""; fi
+    fi
+    if [ "$ok" = 0 ]; then
+      passed=$((passed + 1))
+      # the device's own log (the simulator's or the emulator's, up to 25 MB a run) helps only with a failure
+      find "$debug" -path '*/logs/device-*' -type f -exec rm -f {} +
+      if [ -n "$first" ]; then
+        flakies=$((flakies + 1))
+        echo "  $1: flow $name is flaky: it failed${why:+ $why}, then passed. Not a failure, but fix it (a race, or a wait too short);"
+        echo "    the first try's logs and screen are in ${first#"$root"/}/"
+      fi
+    elif is_real "$2"; then
+      echo "  $1: flow $name failed, see ${out#"$root"/}/$name.log and maestro-runner's own log ${debug#"$root"/}/maestro-runner.log"
+      status=1
+    else
+      echo "  $1: flow $name failed, see ${out#"$root"/}/$name.log and Maestro's own log ${debug#"$root"/}/maestro.log"
+      status=1
+    fi
+    if [ "$ok" != 0 ]; then
+      why=$(why_failed "$2" "$name" | tr '\t' ' ')
+      # a step the device dropped out of has no FAILED line: say so, or it reads as the flow's own failure
+      [ -n "$why" ] || [ "${1%%-*}" != android ] || ! lost_device "$out/$name.log" ||
+        why="when the device went offline, on each try (an emulator under load drops out: check again with fewer devices open)"
+      shot=$(failure_shot "$2")
+      [ -z "$why" ] || echo "    failed $why"
+      [ -z "$shot" ] || echo "    the screen when it failed: ${shot#"$root"/}"
+    fi
+    # for the report: the flow, its result, why it failed, the screenshots it took, the screen when it failed, and a
+    # flaky one's first log
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$([ "$ok" != 0 ] && echo failed || { [ -n "$first" ] && echo flaky; } || echo passed)" "$why" \
+      "$(find "$out" -name '*.png' -newer "$out/.flow-started" | sed "s|^$evidence/||" | sort | tr '\n' ',' | sed 's/,$//')" \
+      "${shot#"$evidence"/}" "${first:+${first#"$evidence"/}/flow.log}" >> "$out/.flows"
+  done
+  # iOS saves a turned screen's screenshots at the device's upright size, with a tag that tells viewers to turn them,
+  # and some viewers ignore it: save them turned (through BMP, which keeps no tag), so every viewer shows the screen
+  case $1 in
+    ios*-landscape) find "$out" -name '*.png' | while read -r png; do
+        sips -s format bmp "$png" --out "$png.bmp" > /dev/null && sips -s format png "$png.bmp" --out "$png" > /dev/null
+        rm -f "$png.bmp"
+      done ;;
+  esac
+  # a screen checked in the wrong orientation would pass for another screen: a turned one's screenshots are wider than
+  # tall, an upright one's taller than wide. A device that didn't turn usually does the next time
+  case $1 in *-landscape) want=wide was=upright ;; *) want=tall was=turned ;; esac
+  wrong=$(find "$out" -name '*.png' -newer "$out/.started" | WANT=$want node -e '
+    const fs = require("fs");
+    for (const f of fs.readFileSync(0, "utf8").split("\n").filter(Boolean)) {
+      const b = Buffer.alloc(24), fd = fs.openSync(f, "r");
+      fs.readSync(fd, b, 0, 24, 0);
+      fs.closeSync(fd);
+      if ((b.readUInt32BE(16) > b.readUInt32BE(20)) !== (process.env.WANT === "wide")) console.log(f);
+    }' | wc -l | tr -d ' ')
+  if [ "$wrong" != 0 ] && [ -z "${5:-}" ]; then
+    echo "  $1: $wrong screenshots show the screen $was, not as this screen needs; running its flows once more"
+    find "$out" -name '*.png' -newer "$out/.started" -exec rm -f {} +
+    status=$before
+    run_flows "$1" "$2" "$3" "$4" again
+    return
+  fi
+  shots=$(find "$out" -name '*.png' | wc -l | tr -d ' ')
+  echo "$1: flows $passed/$total passed$([ "$flakies" = 0 ] || echo " ($flakies flaky)"), $shots screenshots in ${out#"$root"/}"
+  a11y=$(grep -c . "$out/.a11y" 2> /dev/null || true)
+  [ "${a11y:-0}" = 0 ] || echo "  $1: $a11y accessibility warning$([ "$a11y" = 1 ] || echo s) on the flows' screens (controls without a label, tap areas under 48 dp): see the report"
+  if [ "$shots" = 0 ]; then
+    echo "  $1: no screenshots were saved, so there's no evidence; treating this as a failure"
+    status=1
+  elif [ "$wrong" != 0 ]; then
+    echo "  $1: $wrong screenshots show the screen $was: the device or the app didn't turn, so this screen isn't checked; treating this as a failure"
+    status=1
+    # an app that sets its orientation in code (an orientation library, or native code) can keep it although its native
+    # settings allow turning: where it does, so the team can say which is right
+    set_in=$(git grep -l -E 'lockTo(Portrait|Landscape)|OrientationLock\.|lockPlatformAsync|setRequestedOrientation|supportedInterfaceOrientationsFor' \
+      -- ':!scripts/amk' ':!*.md' 2> /dev/null | head -n 3 | tr '\n' ' ')
+    if [ -n "$set_in" ]; then
+      case $was in upright) other=landscape ;; *) other=portrait ;; esac
+      echo "  $1: the app sets its orientation in its code (${set_in% }), which can keep it $was. If it's meant to stay $was, take $other out of its native settings (UISupportedInterfaceOrientations in Info.plist, screenOrientation in AndroidManifest.xml) and this screen isn't checked any more; otherwise change that code"
+    fi
+    echo "  $1: a flow that leaves the app (a call, the camera, a picker) comes back $was when the other app's screen turned the device: turn it back after that step with - setOrientation: \${ORIENTATION}"
+  fi
+}
+
+# runs the flows on each screen given: the phone upright into <platform>/, then <platform>-landscape/,
+# <platform>-tablet/ and <platform>-tablet-landscape/
+check_screens() { # platform phone tablet app_id screens…
+  p=$1 phone=$2 tab=$3 id=$4
+  shift 4
+  # before 2.6, two Maestro runs clash even on different devices (one port): checks on this machine take turns
+  if ! maestro_at_least 2.6.0; then
+    claim_wait maestro "" "Maestro (before 2.6 it runs one check at a time on this machine)" || { status=1; return; }
+  fi
+  for screen in "$@"; do
+    case $screen in
+      tablet-*) [ -n "$tab" ] || continue; on=$tab where=$p-tablet ;;
+      *) [ -n "$phone" ] || continue; on=$phone where=$p ;;
+    esac
+    # Maestro turns an Android device from its natural orientation, which on most tablets is landscape
+    upright=PORTRAIT turned=LANDSCAPE_LEFT
+    if [ "$p" = android ] && "$adb" -s "$on" shell wm size 2> /dev/null |
+      awk -F'[: x]+' '/Physical size/ { found = 1; wide = $3 + 0 > $4 + 0 } END { exit !(found && wide) }'; then
+      upright=LANDSCAPE_LEFT turned=PORTRAIT
+    fi
+    case $screen in *-landscape) turn=$turned where=$where-landscape ;; *) turn=$upright ;; esac
+    # Maestro turns devices from 2.0 on, and taps the right place on a turned iPad from 2.3 (real ones: maestro-runner)
+    need=2.0.0
+    case $where in ios-tablet*) need=2.3.0 ;; esac
+    if [ "$turn" != PORTRAIT ] && ! is_real "$on" && ! maestro_at_least $need; then
+      echo "$where: not checked: turning the device needs Maestro ${need%.0} or later (this is $(maestro_version))"
+      continue
+    fi
+    run_flows "$where" "$on" "$id" "$turn"
+  done
+  release # this platform's devices, and Maestro's turn, for other runs
+  drop_temps
+}
+
+quick() {
+  # each one passes when the app's script passes, or when all its failures were already on the base branch
+  if node scripts/amk/baseline.js lint > "$evidence/lint.log" 2>&1 &&
+    node scripts/amk/baseline.js typecheck > "$evidence/typecheck.log" 2>&1 &&
+    node scripts/amk/baseline.js test $([ "$related" = 0 ] || echo --related) > "$evidence/test.log" 2>&1; then
+    if [ "$related" = 0 ]; then echo "quick: lint, typecheck and tests passed"; else echo "quick: lint, typecheck and the tests related to this branch's changes passed"; fi
+    # what didn't run (no such script, or an Expo app without ESLint yet), and failures the base branch already had
+    cat "$evidence/lint.log" "$evidence/typecheck.log" "$evidence/test.log" |
+      sed -n -E -e 's/^skip: /  skipped: /p' -e 's/^(lint|typecheck|test): /  \1: /p'
+  else
+    echo "quick: FAILED, see the logs in ${evidence#"$root"/}"
+    cat "$evidence/lint.log" "$evidence/typecheck.log" "$evidence/test.log" 2> /dev/null | sed -n -E '/^(lint|typecheck|test): /,/^[^ ]/p' | head -n 20
+    status=1
+  fi
+  # React Native mistakes in the lines this branch changed (the app's rules list them): its problems fail quick, its
+  # warnings don't
+  node scripts/amk/rn-check.js > "$evidence/rn-check.log" 2>&1 || status=1
+  head -n 40 "$evidence/rn-check.log"
+  [ "$(wc -l < "$evidence/rn-check.log")" -le 40 ] || echo "  … all of it in ${evidence#"$root"/}/rn-check.log"
+}
+
+ios() {
+  # iOS builds need Xcode, so off a Mac "all" checks Android and says who has to check iOS
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "ios: not checked here: iOS builds need a Mac with Xcode. A teammate with a Mac runs: sh scripts/amk/verify.sh ios${spec:+ --spec $spec}"
+    [ "$mode" = ios ] && status=1
+    return
+  fi
+  [ "$build_only" = 1 ] || command -v maestro > /dev/null || { echo "ios: Maestro isn't installed (https://maestro.dev)"; status=1; return; }
+  if [ "$no_build" = 0 ]; then
+    # Expo apps without native folders in git: generate ios/ first
+    if ! sh scripts/amk/prebuild.sh ios > "$evidence/prebuild-ios.log" 2>&1; then
+      echo "ios: expo prebuild FAILED, see ${evidence#"$root"/}/prebuild-ios.log"; status=1; return
+    fi
+    # pod install also generates React Native codegen files into ios/build/generated; a newer Podfile needs it again
+    if [ ! -d ios/Pods ] || [ ! -d ios/build/generated ] || [ ios/Podfile -nt ios/Pods/Manifest.lock ]; then
+      if ! sh scripts/amk/pod-install.sh > "$evidence/pod-install.log" 2>&1; then
+        echo "ios: pod install FAILED, see ${evidence#"$root"/}/pod-install.log"; status=1; return
+      fi
+    fi
+  fi
+  # the simulators first, so they boot while Xcode builds. A real iPhone or iPad only when named, as the flows clear
+  # the app's data on it
+  device="" tablet=""
+  if [ "$build_only" = 0 ]; then
+    screens=$(screens_for ios)
+    [ -n "$screens" ] || { echo "ios: none of the app's screens is $only"; return; }
+    if echo "$screens" | grep -q '^phone-'; then
+      take_simulator iPhone "${AMK_IOS_DEVICE:-}" || { status=1; return; }
+      device=$taken
+      if [ -z "$device" ]; then
+        if [ -n "${AMK_IOS_DEVICE:-}" ]; then echo "ios: no simulator or connected iPhone or iPad has the name or UDID \"$AMK_IOS_DEVICE\""; else echo "ios: no iPhone simulator found (set AMK_IOS_DEVICE)"; fi
+        status=1; return
+      fi
+    fi
+    if echo "$screens" | grep -q '^tablet-'; then
+      take_simulator iPad "${AMK_IOS_TABLET:-}" || { status=1; return; }
+      tablet=$taken
+      if [ -z "$tablet" ] && [ -n "${AMK_IOS_TABLET:-}" ]; then echo "ios: no simulator or connected iPad has the name or UDID \"$AMK_IOS_TABLET\""; status=1; return; fi
+      [ -n "$tablet" ] || echo "ios: the app runs on iPad, but there's no iPad simulator, so iPads aren't checked (add one in Xcode, or set AMK_IOS_TABLET)"
+    fi
+    [ -n "$device$tablet" ] || return
+    for d in $device $tablet; do
+      if is_real "$d"; then echo "ios: checking on $d, a real device; the flows clear the app's data on it"
+      else xcrun simctl boot "$d" 2> /dev/null || true; fi
+    done
+  else
+    # the plan's build step: a build for each real device named too
+    for n in "${AMK_IOS_DEVICE:-}" "${AMK_IOS_TABLET:-}"; do
+      [ -z "$n" ] || [ -n "$(simulators iPhone "$n")" ] || { r=$(real_ios "$n"); [ -z "$r" ] || reals="$reals $r"; }
+    done
+  fi
+  team=$(ios_team)
+  if [ -n "$reals" ] && [ -z "$team" ]; then
+    echo "ios: a real device runs only apps signed by an Apple team: set AMK_IOS_TEAM to your team ID (Xcode > Settings > Accounts lists them)"
+    status=1; return
+  fi
+  sims=$build_only # whether to build for simulators: the plan's build step always does
+  for d in $device $tablet; do is_real "$d" || sims=1; done
+  # one build of this project at a time; a check without its own build waits for one that's under way
+  claim_wait "build-ios-$project" "" "the iOS build of this project" || { status=1; return; }
+  if [ "$no_build" = 0 ]; then
+    if [ "$sims" = 1 ] && ! CONFIGURATION=Release sh scripts/amk/ios-build.sh > "$evidence/ios-build.log" 2>&1; then
+      echo "ios: release build FAILED, see ${evidence#"$root"/}/ios-build.log"; status=1; return
+    fi
+    for d in $reals; do
+      if ! CONFIGURATION=Release AMK_IOS_TEAM=$team sh scripts/amk/ios-build.sh device "$d" > "$evidence/ios-device-build.log" 2>&1; then
+        echo "ios: release build for $d FAILED, see ${evidence#"$root"/}/ios-device-build.log"; status=1; return
+      fi
+    done
+  fi
+  unclaim "build-ios-$project"
+  [ "$build_only" = 0 ] || { echo "ios: release build done"; return; }
+  # the newest app: the scheme just built (another scheme's app may still be there from an earlier build)
+  app=$(ls -dt ios/DerivedData/Build/Products/*-iphonesimulator/*.app 2> /dev/null | head -n 1)
+  device_app=$(ls -dt "$root"/ios/DerivedData/Build/Products/*-iphoneos/*.app 2> /dev/null | head -n 1)
+  a=$app
+  [ "$sims" = 1 ] || a=$device_app
+  if [ -z "$a" ] || { [ -n "$reals" ] && [ -z "$device_app" ]; }; then
+    echo "ios: there's no build to check yet: run sh scripts/amk/verify.sh build first"; status=1; return
+  fi
+  app_id=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$a/Info.plist")
+  for d in $device $tablet; do
+    if is_real "$d"; then
+      launch_check "$d" || { status=1; return; }
+    else
+      xcrun simctl bootstatus "$d" -b > /dev/null
+      xcrun simctl install "$d" "$app"
+    fi
+  done
+  check_screens ios "$device" "$tablet" "$app_id" $screens
+  for d in $reals; do crash_reports "$d"; done
+}
+
+# the simulators for $1 (iPhone or iPad), best first: the one named in $2 (name or UDID); else the booted ones,
+# then the others, newest iOS first
+simulators() {
+  xcrun simctl list devices available -j | KIND=$1 WANT=$2 node -e '
+    const all = Object.entries(JSON.parse(require("fs").readFileSync(0, "utf8")).devices)
+      .flatMap(([rt, ds]) => ds.map(d => ({ ...d, v: (rt.match(/iOS-(\d+)-(\d+)/) || []).slice(1).map(Number) })))
+      .filter(d => d.v.length);
+    const want = process.env.WANT;
+    // by device type: a simulator can have any name, such as a separate one kept for tests
+    const kind = all.filter(d => (d.deviceTypeIdentifier || d.name).includes(process.env.KIND))
+      .sort((a, b) => (b.state === "Booted") - (a.state === "Booted") || b.v[0] - a.v[0] || b.v[1] - a.v[1]);
+    const list = want ? all.filter(d => d.udid === want || d.name === want).slice(0, 1) : kind;
+    console.log(list.map(d => d.udid).join("\n"));'
+}
+# a simulator for $1 (iPhone or iPad) that this run holds, in $taken: the one named in $2, once it's free; else the
+# first free one; else the best one, once it's free. Empty when there's none. A name no simulator has can be a real
+# device's
+take_simulator() {
+  taken=""
+  if [ "$part_k" -gt 1 ]; then
+    first=$(simulators "$1" "$2" | head -n 1)
+    if [ -z "$first" ]; then
+      [ -z "$2" ] || { echo "ios: part $part of the flows runs on a copy of the device, which works only for a simulator, not $2"; return 1; }
+      return 0
+    fi
+    temp_simulator "$first" || { echo "ios: couldn't make a simulator for part $part of the flows"; return 1; }
+    claim "ios-$taken" "$taken" || true
+    echo "ios: part $part of the flows runs on a temporary $1 simulator like $first, deleted afterwards"
+    return 0
+  fi
+  candidates=$(simulators "$1" "$2")
+  if [ -z "$candidates" ] && [ -n "$2" ]; then
+    candidates=$(real_ios "$2")
+    [ -z "$candidates" ] || reals="$reals $candidates"
+  fi
+  [ -n "$candidates" ] || return 0
+  first=$(echo "$candidates" | head -n 1)
+  if [ -z "$2" ]; then
+    for u in $candidates; do claim "ios-$u" "$u" && { taken=$u; break; }; done
+    [ -z "$taken" ] || [ "$taken" = "$first" ] || echo "ios: $first is in use by $(holder "ios-$first"), so checking on $taken"
+  fi
+  [ -n "$taken" ] || { claim_wait "ios-$first" "$first" "the $1 $first" || return 1; taken=$first; }
+}
+
+# Real iPhones and iPads, through Xcode's devicectl (iOS 17 or later). Maestro doesn't run on them, so their flows run
+# through maestro-runner: pinned, as a newer one may behave differently, and without its usage data
+runner=maestro-runner@1.1.29
+reals="" # the real devices this run checks on
+is_real() { case " $reals " in *" $1 "*) ;; *) return 1 ;; esac; }
+# the UDID of the connected iPhone or iPad with the name or UDID $1
+real_ios() {
+  xcrun devicectl list devices --json-output "$evidence/.devices.json" > /dev/null 2>&1 || return 0
+  WANT=$1 node -e 'const want = process.env.WANT;
+    const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).result.devices.find(d => d.hardwareProperties?.reality === "physical" &&
+      [d.identifier, d.deviceProperties?.name, d.hardwareProperties.udid].includes(want));
+    if (d) console.log(d.hardwareProperties.udid);' "$evidence/.devices.json"
+}
+# the Apple team that signs the app and WebDriverAgent for real devices: AMK_IOS_TEAM, else the project's
+ios_team() { echo "${AMK_IOS_TEAM:-$(sed -n 's/.*DEVELOPMENT_TEAM = "\{0,1\}\([A-Z0-9]\{10\}\)"\{0,1\};.*/\1/p' ios/*.xcodeproj/project.pbxproj 2> /dev/null | head -n 1)}"; }
+# installs the app on the real device $1 and opens it, so what the device needs (trusting the team, unlocking) shows
+# before the flows, and an app that closes at once is caught with its crash report. Notes the crash reports already there
+launch_check() {
+  exe=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$device_app/Info.plist")
+  crashes "$1" > "$evidence/.crashes-$1"
+  log=$evidence/launch-$1.log
+  if ! xcrun devicectl device install app --device "$1" "$device_app" > "$log" 2>&1; then
+    echo "ios: the app didn't install on $1 (is it unlocked, with Developer Mode on?), see ${log#"$root"/}"
+    return 1
+  fi
+  # a device now and then refuses an app it has just installed for a moment, as if it didn't trust the team
+  tries=0
+  until said=$(xcrun devicectl device process launch --device "$1" --terminate-existing "$app_id" 2>&1); do
+    echo "$said" >> "$log"
+    tries=$((tries + 1))
+    case $said in
+      *'explicitly trusted'*) [ "$tries" -lt 3 ] || {
+          echo "ios: $1 doesn't open apps from this team: on it, trust the team (Settings > General > VPN & Device Management > Developer App > Trust), and turn airplane mode off (offline, it doesn't open apps signed for development). Then run this again"
+          return 1; } ;;
+      *) echo "ios: the app didn't open on $1 (is it unlocked?), see ${log#"$root"/}"; return 1 ;;
+    esac
+    sleep 10
+  done
+  echo "$said" >> "$log"
+  sleep 10
+  xcrun devicectl device info processes --device "$1" --json-output "$evidence/.processes.json" > /dev/null 2>&1 || true
+  if ! grep -qs "/$(basename "$device_app")/" "$evidence/.processes.json"; then
+    echo "ios: the app closed within 10 seconds of opening on $1"
+    crash_reports "$1"
+    return 1
+  fi
+}
+# the app's crash reports on the real device $1
+crashes() {
+  xcrun devicectl device info files --device "$1" --domain-type systemCrashLogs --json-output "$evidence/.files.json" > /dev/null 2>&1 || return 0
+  EXE=$exe node -e 'for (const f of JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).result.files || [])
+    if (f.relativePath.startsWith(process.env.EXE + "-") && f.relativePath.endsWith(".ips")) console.log(f.relativePath)' "$evidence/.files.json"
+}
+# the ones that weren't there before launch_check join the evidence: the app crashed during the checks
+crash_reports() {
+  new=$(crashes "$1" | grep -v -x -F -f "$evidence/.crashes-$1" || true)
+  [ -n "$new" ] || return 0
+  mkdir -p "$evidence/crashes"
+  for c in $new; do
+    xcrun devicectl device copy from --device "$1" --domain-type systemCrashLogs --source "$c" --destination "$evidence/crashes/$c" > /dev/null 2>&1 || true
+  done
+  echo "ios: the app crashed on $1 during the checks: $(echo "$new" | wc -l | tr -d ' ') crash reports in ${evidence#"$root"/}/crashes"
+  status=1
+}
+
+# a running emulator's adb serial: of the AVD named in $1 if one is, else of the kind in $2 (phone or tablet) if given
+running_emulator() {
+  for d in $("$adb" devices | awk 'NR > 1 && $2 == "device" && /^emulator-/ { print $1 }'); do
+    if [ -n "$1" ]; then
+      [ "$("$adb" -s "$d" emu avd name 2> /dev/null | head -n 1 | tr -d '\r')" = "$1" ] || continue
+    elif [ -n "${2:-}" ]; then
+      [ "$(kind_of "$(device_width "$d")")" = "$2" ] || continue
+    fi
+    echo "$d"; return
+  done
+}
+
+# a screen's smallest width in dp: 600 and up is a tablet
+kind_of() { if [ "${1:-0}" -ge 600 ]; then echo tablet; else echo phone; fi; }
+device_width() {
+  "$adb" -s "$1" shell 'wm size; wm density' 2> /dev/null | tr -d '\r' | awk -F': ' '
+    /Physical size/ { split($2, s, "x"); w = s[1] + 0 < s[2] + 0 ? s[1] : s[2] } /Physical density/ { d = $2 }
+    END { if (d) print int(w * 160 / d) }'
+}
+# the screen density (dpi) of the Android device $1: the one set for it, else its own
+device_density() {
+  "$adb" -s "$1" shell 'wm size; wm density' 2> /dev/null | tr -d '\r' | awk -F': ' '/Override density/ { o = $2 } /Physical density/ { p = $2 } END { print o ? o : p }'
+}
+avd_home=${ANDROID_AVD_HOME:-${ANDROID_USER_HOME:-$HOME/.android}/avd}
+# an AVD's folder: its .ini names it (an AVD can be renamed, and keep its folder), else <name>.avd
+avd_dir() { d=$(sed -n 's/^path=//p' "$avd_home/$1.ini" 2> /dev/null | head -n 1); echo "${d:-$avd_home/$1.avd}"; }
+# a temporary AVD with the settings of AVD $1 (not its data), in $tavd, for a part of the flows after the first
+temp_avd() {
+  tavd="amk_part_${part_k}_$$_$(printf %s "$1" | tr -c 'A-Za-z0-9._-' _)"
+  [ -f "$(avd_dir "$1")/config.ini" ] && mkdir -p "$avd_home/$tavd.avd" || return 1
+  temps="$temps avd:$tavd"
+  grep -v -E '^(avd\.ini\.displayname|AvdId|avd\.id|fastboot\.)' "$(avd_dir "$1")/config.ini" > "$avd_home/$tavd.avd/config.ini"
+  printf 'avd.ini.displayname=%s\nAvdId=%s\n' "$tavd" "$tavd" >> "$avd_home/$tavd.avd/config.ini"
+  printf 'avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/%s.avd\ntarget=%s\n' "$avd_home/$tavd.avd" "$tavd" \
+    "$(sed -n 's/^target=//p' "$avd_home/$1.ini" 2> /dev/null | head -n 1)" > "$avd_home/$tavd.ini"
+}
+# a temporary simulator of the same type and iOS version as simulator $1, in $taken, for a part after the first
+temp_simulator() {
+  like=$(xcrun simctl list devices available -j | UDID=$1 node -e '
+    for (const [rt, ds] of Object.entries(JSON.parse(require("fs").readFileSync(0, "utf8")).devices))
+      for (const d of ds) if (d.udid === process.env.UDID) console.log(d.deviceTypeIdentifier, rt);')
+  [ -n "$like" ] || return 1
+  taken=$(xcrun simctl create "amk part $part_k of $part_n ($$)" $like) && [ -n "$taken" ] || return 1
+  temps="$temps ios:$taken"
+}
+# waits until adb no longer lists the emulator $1 (up to $2 seconds): it has stopped, or is about to
+gone() { tries=0; while [ -n "$(running_emulator "$1" 2> /dev/null || true)" ] && [ "$tries" -lt "$2" ]; do tries=$((tries + 1)); sleep 1; done; }
+# deletes the temporary devices this run made: their data goes with them
+drop_temps() {
+  for t in $temps; do
+    case $t in
+      ios:*) xcrun simctl shutdown "${t#ios:}" > /dev/null 2>&1 || true; xcrun simctl delete "${t#ios:}" > /dev/null 2>&1 || true ;;
+      avd:*)
+        n=${t#avd:}
+        s=$(running_emulator "$n" 2> /dev/null || true)
+        [ -z "$s" ] || "$adb" -s "$s" emu kill > /dev/null 2>&1 || true
+        gone "$n" 30
+        # an emulator can hold its files for a moment after adb lets it go (on Windows, a file in use can't be deleted)
+        tries=0
+        until rm -rf "${avd_home:?}/$n.avd" "$avd_home/$n.ini" 2> /dev/null && [ ! -e "$avd_home/$n.avd" ] || [ "$tries" -ge 5 ]; do
+          tries=$((tries + 1)); sleep 2
+        done ;;
+    esac
+  done
+  temps=""
+}
+# the same for an emulator that isn't running, from its config.ini
+avd_width() {
+  awk -F' *= *' '$1 == "hw.lcd.width" { w = $2 } $1 == "hw.lcd.height" { h = $2 } $1 == "hw.lcd.density" { d = $2 }
+    END { if (d) print int((w + 0 < h + 0 ? w : h) * 160 / d) }' \
+    "$(avd_dir "$1")/config.ini" 2> /dev/null || true
+}
+# the emulators of the kind $1 (phone or tablet), best first: the running ones, then the others
+emulators() {
+  {
+    for d in $("$adb" devices | awk 'NR > 1 && $2 == "device" && /^emulator-/ { print $1 }'); do
+      [ "$(kind_of "$(device_width "$d")")" != "$1" ] || "$adb" -s "$d" emu avd name 2> /dev/null | head -n 1 | tr -d '\r'
+    done
+    for a in $avds; do [ "$(kind_of "$(avd_width "$a")")" != "$1" ] || echo "$a"; done
+  } | awk 'NF && !seen[$0]++'
+}
+# an Android device of the kind $1 that this run holds, in $taken (its serial): the device ($2, an adb serial) or
+# emulator ($3) named for it, once it's free; else the first free emulator of that kind, running or not; else the
+# best one, once it's free. Empty when there's none of that kind. An emulator is claimed by its name, however named
+take_android() {
+  taken="" pick=""
+  if [ "$part_k" -gt 1 ]; then
+    src=$3
+    if [ -n "$2" ]; then
+      case $2 in
+        emulator-*) src=$("$adb" -s "$2" emu avd name 2> /dev/null | head -n 1 | tr -d '\r') ;;
+        *) echo "android: part $part of the flows runs on a copy of the device, which works only for an emulator, not $2"; return 1 ;;
+      esac
+    fi
+    [ -n "$src" ] || src=$(emulators "$1" | head -n 1)
+    [ -n "$src" ] || return 0
+    temp_avd "$src" || { echo "android: couldn't copy emulator $src for part $part of the flows"; return 1; }
+    taken=$(start_emulator "$tavd") || { echo "android: the copy of emulator $src for part $part of the flows didn't start"; return 1; }
+    # a new emulator's first boot drops its adb connection during flows ("device offline"), however long it's left;
+    # started again, it doesn't (measured: 5 of 6 runs failed on first boots, 6 of 6 passed after a restart). It's
+    # stopped through its console, as adb itself can be offline then, and started again
+    android_ready "$taken" || { echo "android: the copy of emulator $src for part $part of the flows didn't start"; return 1; }
+    "$adb" -s "$taken" emu kill > /dev/null 2>&1 || true
+    gone "$tavd" 60
+    taken=$(start_emulator "$tavd") || { echo "android: the copy of emulator $src for part $part of the flows didn't start again"; return 1; }
+    claim "android-avd-$tavd" "$taken" || true
+    echo "android: part $part of the flows runs on a temporary copy of emulator $src, deleted afterwards"
+    return 0
+  fi
+  if [ -n "$2" ]; then
+    key=android-$2
+    case $2 in emulator-*) key=android-avd-$("$adb" -s "$2" emu avd name 2> /dev/null | head -n 1 | tr -d '\r') ;; esac
+    claim_wait "$key" "$2" "$2" || return 1
+    taken=$2
+    return 0
+  fi
+  if [ -n "$3" ]; then
+    echo "$avds" | grep -qxF "$3" || { echo "android: there's no emulator named $3 (see: emulator -list-avds)"; return 1; }
+    names=$3
+  else
+    names=$(emulators "$1")
+  fi
+  [ -n "$names" ] || return 0
+  first=$(echo "$names" | head -n 1)
+  if [ -z "$3" ]; then
+    for n in $names; do claim "android-avd-$n" "$(running_emulator "$n")" && { pick=$n; break; }; done
+    [ -z "$pick" ] || [ "$pick" = "$first" ] || echo "android: emulator $first is in use by $(holder "android-avd-$first"), so checking on $pick"
+  fi
+  [ -n "$pick" ] || { claim_wait "android-avd-$first" "$(running_emulator "$first")" "emulator $first" || return 1; pick=$first; }
+  taken=$(running_emulator "$pick")
+  [ -n "$taken" ] || taken=$(start_emulator "$pick") || { echo "android: emulator $pick didn't start"; return 1; }
+}
+# starts the AVD $1 and prints its serial once adb sees it (up to 5 minutes)
+start_emulator() {
+  nohup "$sdk/emulator/emulator" -avd "$1" -no-snapshot-save -no-boot-anim > /dev/null 2>&1 &
+  tries=0
+  until serial=$(running_emulator "$1") && [ -n "$serial" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 150 ] || return 1
+    sleep 2
+  done
+  echo "$serial"
+}
+
+# waits for the Android device $1 to finish starting, for up to 5 minutes
+android_ready() {
+  tries=0
+  until [ "$("$adb" -s "$1" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 100 ] || return 1
+    sleep 3
+  done
+}
+
+android() {
+  [ "$build_only" = 1 ] || command -v maestro > /dev/null || { echo "android: Maestro isn't installed (https://maestro.dev)"; status=1; return; }
+  case $(uname -s) in # where Android Studio puts the SDK by default
+    Darwin) default_sdk=$HOME/Library/Android/sdk ;;
+    MINGW* | MSYS* | CYGWIN*) default_sdk=${LOCALAPPDATA:-$HOME/AppData/Local}/Android/Sdk ;;
+    *) default_sdk=$HOME/Android/Sdk ;;
+  esac
+  sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$default_sdk}}
+  # Gradle finds the SDK through it too: an AI tool started from the Dock or a menu doesn't load the shell's profile
+  [ -n "${ANDROID_HOME:-}" ] || export ANDROID_HOME="$sdk"
+  adb="$sdk/platform-tools/adb"
+  # Expo apps without native folders in git: generate android/ first
+  if [ "$no_build" = 0 ] && ! sh scripts/amk/prebuild.sh android > "$evidence/prebuild-android.log" 2>&1; then
+    echo "android: expo prebuild FAILED, see ${evidence#"$root"/}/prebuild-android.log"; status=1; return
+  fi
+  # apps with product flavors: check one, the first in build.gradle unless --flavor names another
+  if [ -z "$flavor" ]; then
+    code=0
+    flavors=$(node scripts/amk/android-flavors.js) || code=$?
+    case $code in
+      0) ;;
+      2) echo "android: the app has several flavor dimensions; name the variant with --flavor (for example devFree)"; status=1; return ;;
+      *) echo "android: couldn't read the product flavors from build.gradle (see the error above)"; status=1; return ;;
+    esac
+    flavor=$(echo "$flavors" | head -n 1)
+    [ -z "$flavor" ] || echo "android: checking the \"$flavor\" flavor (the app has: $(echo $flavors)); --flavor <name> checks another"
+  fi
+  variant=$(printf %s "$flavor" | awk '{ print toupper(substr($0, 1, 1)) substr($0, 2) }')
+  device="" tablet=""
+  if [ "$build_only" = 1 ]; then
+    # no device to ask: emulators run this machine's CPU type
+    case $(uname -m) in arm64 | aarch64) abi=arm64-v8a ;; *) abi=x86_64 ;; esac
+  else
+    # the devices first: the build only needs the CPU type, and emulators boot while Gradle builds.
+    # The flows clear the app's data, so a phone plugged in over USB is used only when AMK_ANDROID_DEVICE names it
+    screens=$(screens_for android)
+    [ -n "$screens" ] || { echo "android: none of the app's screens is $only"; return; }
+    avds=$("$sdk/emulator/emulator" -list-avds 2> /dev/null || true)
+    if echo "$screens" | grep -q '^phone-'; then
+      take_android phone "${AMK_ANDROID_DEVICE:-}" "${AMK_ANDROID_AVD:-}" || { status=1; return; }
+      # only tablet emulators: one of them
+      [ -n "$taken" ] || take_android tablet "" "" || { status=1; return; }
+      device=$taken
+      if [ -z "$device" ]; then
+          phone=$("$adb" devices | awk 'NR > 1 && $2 == "device" { print $1; exit }')
+          echo "android: no emulator found (create one in Android Studio)"
+          [ -z "$phone" ] || echo "  or check on the phone $phone, which clears the app's data on it: AMK_ANDROID_DEVICE=$phone sh scripts/amk/verify.sh android"
+          status=1; return
+      fi
+      case $device in
+        emulator-*) echo "android: checking on $device" ;;
+        *) echo "android: checking on the phone $device; the flows clear the app's data on it" ;;
+      esac
+    fi
+    if echo "$screens" | grep -q '^tablet-'; then
+      take_android tablet "${AMK_ANDROID_TABLET:-}" "${AMK_ANDROID_TABLET_AVD:-}" || { status=1; return; }
+      tablet=$taken
+      [ -n "$tablet" ] || echo "android: the app runs on tablets, but there's no tablet emulator, so tablets aren't checked (create one in Android Studio: Device Manager > Tablet, or set AMK_ANDROID_TABLET_AVD)"
+      [ "$tablet" != "$device" ] || tablet="" # only tablet emulators: the one in use is checked as the phone
+      case $tablet in
+        "") ;;
+        emulator-*) echo "android: tablets on $tablet" ;;
+        *) echo "android: tablets on $tablet; the flows clear the app's data on it" ;;
+      esac
+    fi
+    [ -n "$device$tablet" ] || return
+    # an emulator that has just started (another one starting too) may not answer for a moment
+    first=${device:-$tablet}
+    tries=0
+    until abi=$("$adb" -s "$first" shell getprop ro.product.cpu.abi 2> /dev/null | tr -d '\r') && [ -n "$abi" ]; do
+      tries=$((tries + 1))
+      [ "$tries" -le 30 ] || { echo "android: device $first isn't connected (see: adb devices)"; status=1; return; }
+      sleep 2
+    done
+  fi
+  # one build of this project at a time; a check without its own build waits for one that's under way
+  claim_wait "build-android-$project" "" "the Android build of this project" || { status=1; return; }
+  if [ "$no_build" = 0 ]; then
+    # native code for that CPU type only, as run-android --active-arch-only does: much faster than all four
+    set -- -PreactNativeArchitectures="$abi"
+    # signed with the project's debug key, so the check build installs whatever key its real release needs
+    if [ -f android/app/debug.keystore ]; then
+      keystore=$(cd android/app && { pwd -W 2> /dev/null || pwd; })/debug.keystore # pwd -W: a Windows path in Git Bash
+      set -- "$@" -Pandroid.injected.signing.store.file="$keystore" -Pandroid.injected.signing.store.password=android \
+        -Pandroid.injected.signing.key.alias=androiddebugkey -Pandroid.injected.signing.key.password=android
+    fi
+    # a check build isn't a release: its mapping files and debug symbols stay off the crash reporters
+    set -- "$@" --init-script "$(cd scripts/amk && { pwd -W 2> /dev/null || pwd; })/no-symbol-upload.gradle"
+    if ! (cd android && SENTRY_DISABLE_AUTO_UPLOAD=true ./gradlew "assemble${variant}Release" --no-daemon -q "$@") > "$evidence/android-build.log" 2>&1; then
+      echo "android: release build FAILED, see ${evidence#"$root"/}/android-build.log"; status=1; return
+    fi
+  fi
+  unclaim "build-android-$project"
+  [ "$build_only" = 0 ] || { echo "android: release build done"; return; }
+  # apps that split APKs by CPU type get one per type: take this device's, else the universal one
+  apks=$(ls android/app/build/outputs/apk/${flavor:+$flavor/}release/*.apk 2> /dev/null || true)
+  [ -n "$apks" ] || { echo "android: there's no build to check yet: run sh scripts/amk/verify.sh build first"; status=1; return; }
+  apk=$(echo "$apks" | grep -e "-$abi-" | head -n 1)
+  [ -n "$apk" ] || apk=$(echo "$apks" | grep universal | head -n 1)
+  [ -n "$apk" ] || apk=$(echo "$apks" | head -n 1)
+  # the app ID from the built APK, which includes flavor suffixes such as .dev
+  aapt2="$(ls -d "$sdk"/build-tools/*/ 2> /dev/null | sort -V | tail -n 1)aapt2"
+  app_id=$("$aapt2" dump badging "$apk" 2> /dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+  [ -n "$app_id" ] || app_id=$(sed -n 's/.*applicationId *=\{0,1\} *"\([^"]*\)".*/\1/p' android/app/build.gradle* | head -n 1)
+  if [ -n "$device" ]; then
+    android_ready "$device" || { echo "android: $device didn't finish starting (see: adb devices)"; status=1; return; }
+    "$adb" -s "$device" install -r "$apk" > /dev/null
+  fi
+  if [ -n "$tablet" ]; then
+    if ! android_ready "$tablet"; then echo "android: $tablet didn't finish starting, so tablets aren't checked"; tablet=""
+    elif ! "$adb" -s "$tablet" install -r "$apk" > /dev/null 2>&1; then
+      echo "android: the app didn't install on the tablet $tablet (a different CPU type?), so tablets aren't checked"; tablet=""
+    fi
+  fi
+  for d in $device $tablet; do
+    # system "isn't responding" pop-ups (common on busy emulators) cover the app and fail flows; app crashes still fail
+    # them. Emulators only: the setting is device-wide and stays, so a phone keeps showing them
+    case $d in emulator-*) "$adb" -s "$d" shell settings put global hide_error_dialogs 1 ;; esac
+    "$adb" -s "$d" shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS > /dev/null 2>&1 || true
+  done
+  check_screens android "$device" "$tablet" "$app_id" $screens
+}
+
+# both release builds at the same time, each in its own log; the --no-build checks on each device come after
+build() {
+  build_only=1
+  ios_pid=""
+  if [ "$(uname -s)" = Darwin ]; then
+    (trap release EXIT; ios; exit $status) > "$evidence/build-ios.out" 2>&1 &
+    ios_pid=$!
+  fi
+  (trap release EXIT; android; exit $status) > "$evidence/build-android.out" 2>&1 &
+  android_pid=$!
+  [ -z "$ios_pid" ] || wait "$ios_pid" || status=1
+  wait "$android_pid" || status=1
+  cat "$evidence"/build-*.out
+}
+
+# Checking every device at the same time, one subagent each, is faster where the machine has room: about 20 GB of
+# memory for four devices and both builds, and Maestro 2.6 or later, which runs several devices at once
+plan() {
+  set -- $(node -e 'const os = require("os"), fs = require("fs"), s = fs.statfsSync(".");
+    console.log(Math.round(os.totalmem() / 2 ** 30), Math.round(s.bavail * s.bsize / 2 ** 30))')
+  mem=$1
+  case ${AMK_MEMORY_GB:-x} in *[!0-9]*) ;; *) mem=$AMK_MEMORY_GB ;; esac
+  case ${AMK_DISK_GB:-x} in *[!0-9]*) ;; *) set -- "$1" "$AMK_DISK_GB" ;; esac
+  have="$mem GB of memory, $2 GB free disk, Maestro $(maestro_version)"
+  # the devices to check, phones first and the platforms mixed, so a round of two has one of each
+  # (each platform's screens are read first: grep -q stops reading at its first match, and a writer still going then
+  # says "Broken pipe")
+  checks="" ios_screens="" android_screens=$(screens_for android)
+  [ "$(uname -s)" != Darwin ] || ios_screens=$(screens_for ios)
+  for kind in phone tablet; do
+    if echo "$ios_screens" | grep -q "^$kind-"; then checks="$checks ios:$kind"; fi
+    if echo "$android_screens" | grep -q "^$kind-"; then checks="$checks android:$kind"; fi
+  done
+  n=$(echo $checks | wc -w | tr -d ' ')
+  # a device under test takes about 6 GB (a simulator or an emulator with Maestro: an iPhone simulator and a phone
+  # emulator at once measured 11 GB), and macOS and the rest about 4 GB: 2 devices at once from 16 GB, 4 from 28 GB
+  slots=$(( (mem - 4) / 6 ))
+  case ${AMK_DEVICES:-x} in *[!0-9]*) ;; *) slots=$AMK_DEVICES ;; esac
+  why=""
+  case ${AMK_PARALLEL:-} in
+    0) why="AMK_PARALLEL=0" ;;
+    1) [ "$slots" -ge "$n" ] || slots=$n ;;
+    *)
+      if [ "$slots" -lt 2 ]; then why=${AMK_DEVICES:+AMK_DEVICES=$AMK_DEVICES}; why=${why:-it needs 16 GB of memory}; fi
+      [ "$2" -ge 20 ] || why="${why:+$why and }it needs 20 GB free disk"
+      maestro_at_least 2.6.0 || why="${why:+$why and }it needs Maestro 2.6 or later" ;;
+  esac
+  # room for more devices than kinds: each kind's flows split into parts, each part on a device of its own
+  # A part's device is one more: about 6 GB for a simulator, 8 GB for an emulator (measured with 4 GB of guest memory),
+  # so parts need room for every kind's devices at once; AMK_DEVICES says how many outright
+  flows=$(flow_files | grep -c . || true)
+  parts=1
+  if [ "$slots" -gt "$n" ] && [ "$flows" -ge 2 ]; then
+    parts=$((slots / n))
+    case ${AMK_DEVICES:-x} in
+      *[!0-9]*)
+        per=0
+        for c in $checks; do case $c in ios:*) per=$((per + 6)) ;; *) per=$((per + 8)) ;; esac; done
+        [ "$parts" -le $(( (mem - 4) / per )) ] || parts=$(( (mem - 4) / per )) ;;
+    esac
+    [ "$parts" -le "$flows" ] || parts=$flows
+    [ "$parts" -ge 1 ] || parts=1
+  fi
+  [ "$n" -ge 2 ] || [ "$parts" -ge 2 ] || why="there's one device to check"
+  if [ -n "$why" ]; then
+    echo "plan: $have: one device at a time ($why; AMK_PARALLEL=1 overrides)"
+    echo "  sh scripts/amk/verify.sh all${args:+ $args}"
+    return
+  fi
+  # one command per device, a kind's parts next to each other. A real iPhone, iPad or phone can't be copied for a
+  # part, so it runs all its flows
+  jobs=""
+  for c in $checks; do
+    p=$parts
+    case $c in
+      ios:phone) [ -z "${AMK_IOS_DEVICE:-}" ] || [ -n "$(simulators iPhone "$AMK_IOS_DEVICE")" ] || p=1 ;;
+      ios:tablet) [ -z "${AMK_IOS_TABLET:-}" ] || [ -n "$(simulators iPad "$AMK_IOS_TABLET")" ] || p=1 ;;
+      android:phone) case ${AMK_ANDROID_DEVICE:-emulator-} in emulator-*) ;; *) p=1 ;; esac ;;
+      android:tablet) case ${AMK_ANDROID_TABLET:-emulator-} in emulator-*) ;; *) p=1 ;; esac ;;
+    esac
+    i=1
+    while [ "$i" -le "$p" ]; do
+      cmd="sh scripts/amk/verify.sh ${c%:*} --no-build --screens ${c#*:}"
+      [ "$p" = 1 ] || cmd="$cmd --part $i/$p"
+      jobs="$jobs$cmd${args:+ $args}
+"
+      i=$((i + 1))
+    done
+  done
+  total=$(printf %s "$jobs" | grep -c .)
+  rounds=$(( (total + slots - 1) / slots ))
+  if [ "$rounds" -gt 1 ]; then echo "plan: $have: $slots devices at a time, in $rounds rounds"
+  elif [ "$parts" -gt 1 ]; then echo "plan: $have: check on $total devices at the same time, each kind's flows in parts"
+  else echo "plan: $have: check the $n devices at the same time"; fi
+  echo "  1. sh scripts/amk/verify.sh quick${args:+ $args}"
+  echo "  2. sh scripts/amk/verify.sh build${args:+ $args}"
+  r=1
+  while [ "$r" -le "$rounds" ]; do
+    if [ "$rounds" = 1 ]; then echo "  3. at the same time, each in its own subagent (m-device-checker), which checks its screenshots and reports:"
+    elif [ "$r" = 1 ]; then echo "  3. round 1 of $rounds, at the same time, each in its own subagent (m-device-checker), which checks its screenshots and reports:"
+    else echo "  $((r + 2)). round $r of $rounds, once round $((r - 1)) has reported, the same way:"; fi
+    printf %s "$jobs" | sed -n "$(( (r - 1) * slots + 1 )),$(( r * slots ))p" | sed 's/^/     /'
+    r=$((r + 1))
+  done
+  [ "$(uname -s)" = Darwin ] || echo "  iOS isn't checked here: it needs a Mac with Xcode"
+}
+
+# a part beyond the flows (more parts than flows) has nothing to check: no build, and no device made for it
+if [ -n "$part" ] && [ -z "$(flow_files)" ]; then
+  case $mode in ios | android | all) echo "verify: part $part has no flows: there are fewer flows than parts"; exit 0 ;; esac
+fi
+
+# a build that runs out of disk halfway (Xcode, Gradle and simulators fill disks) wastes the whole run: stop before it.
+# Not in CI, where a machine lasts one run
+case $mode in ios | android | all | build)
+  if [ "$no_build" = 0 ] && [ -z "${CI:-}" ]; then
+    free=$(node -e 'const s = require("fs").statfsSync("."); console.log(Math.floor(s.bavail * s.bsize / 2 ** 30))')
+    case ${AMK_DISK_GB:-x} in *[!0-9]*) ;; *) free=$AMK_DISK_GB ;; esac
+    need=5 what="a release build needs about 5"
+    # a first iOS build (no pods or no build folder yet) downloads pods and Hermes and boots a simulator: about 6 GB measured
+    if [ "$mode" != android ] && [ "$(uname -s)" = Darwin ] && { [ ! -d ios/Pods ] || [ ! -d ios/DerivedData ]; }; then
+      need=8 what="a first iOS build (pods, Hermes and a simulator) needs about 8"
+    fi
+    if [ "$free" -lt "$need" ]; then
+      echo "verify: only $free GB of disk is free here, and $what. Free some (Xcode's DerivedData, simulators and emulators you don't use, Gradle's caches), then run it again"
+      exit 1
+    fi
+  fi ;;
+esac
+
+case $mode in
+  quick) quick ;;
+  ios) ios ;;
+  android) android ;;
+  all) quick; ios; android ;;
+  build) build ;;
+  plan) plan; exit 0 ;;
+  approve) node scripts/amk/shots.js approve "$evidence"; exit $? ;;
+  *) echo "verify: unknown mode $mode (quick, ios, android, all, build, plan or approve)"; exit 2 ;;
+esac
+
+# the run's report, from every screen checked so far: other devices, parts and rounds add theirs. First, the screenshots
+# that differ from the approved ones, which the report lists too
+case $mode in
+  ios | android | all) [ -z "$(find "$evidence" -name .flows 2> /dev/null | head -n 1)" ] || node scripts/amk/shots.js compare "$evidence" || true
+    if [ -n "$(find "$evidence" -name .flows 2> /dev/null | head -n 1)" ] && node scripts/amk/report.js "$evidence" > /dev/null 2>&1; then
+      echo "Report: ${evidence#"$root"/}/report.md (each flow's result, why one failed, and its screenshots)"
+    fi ;;
+esac
+echo "Evidence: ${evidence#"$root"/}/ (open the screenshots: a tool saying 'passed' isn't proof)"
+exit $status
