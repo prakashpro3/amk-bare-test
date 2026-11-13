@@ -1,4 +1,4 @@
-<!-- KIT:START agentic-mobile-kit 0.14.0 ci=github,codemagic stack=bare (edit outside these markers; the kit updates what's inside) -->
+<!-- KIT:START agentic-mobile-kit 0.14.1 ci=github,codemagic stack=bare (edit outside these markers; the kit updates what's inside) -->
 # BareApp: instructions for AI agents
 
 Read by Claude Code (through CLAUDE.md), Codex, Cursor, OpenCode, Kiro and Antigravity; details live in `docs/amk/`.
