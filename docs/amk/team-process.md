@@ -6,7 +6,7 @@
 - Run at most 2 or 3 agents in parallel per person.
 - Don't use "skip permissions", "YOLO" or auto-run modes in any tool.
 - Keep secrets out of the repo folder; inject them at run time.
-- Review the metrics and the `m-learn` changes (`git log --grep 'chore(learn)'`) once a month. Re-check `AGENTS.md` and `docs/amk/` after every React Native, Xcode or Android Gradle Plugin upgrade, and after switching AI models.
+- Review the metrics (`node scripts/amk/metrics.js`) and the `m-learn` changes (`git log --grep 'chore(learn)'`) once a month, and run `m-learn review` for what reviews keep finding. Re-check `AGENTS.md` and `docs/amk/` after every React Native, Xcode or Android Gradle Plugin upgrade, and after switching AI models.
 
 ## Settings for the agents
 
@@ -16,7 +16,7 @@
        batches, then /m-feature build). -->
 - Reviewers: team
   <!-- team: another person approves each pull request, and the build turns on auto-merge (pr.js automerge), so it
-       merges once approved and green. solo: GitHub doesn't let you approve your own pull request, so you review it and
+       merges once approved and green; only where main requires an approval, else a person merges it. solo: GitHub doesn't let you approve your own pull request, so you review it and
        add the amk-ready label, which turns on auto-merge (.github/workflows/amk-ready.yml); a new commit takes the
        label off again. Branch protection: docs/branch-protection.md in the kit. -->
 - Merge method:
@@ -31,6 +31,9 @@
   <!-- on: a feature the unattended build blocks gets a GitHub issue "Blocked: <id>" with its question, and m-continue
        reads the answer there. Off by default: clients often watch their private repositories, and agents don't message
        clients. -->
+- Sentry adds amk-fix: off
+  <!-- on: an issue Sentry's GitHub integration labels amk-fix (an alert rule can) joins the overnight bug queue
+       (autopilot.js), like one a team member labels. Off: only people who can label issues queue bugs. -->
 - Variables for unattended runs: none
   <!-- autopilot.js gives each session only PATH, HOME, the tool's sign-in, GH_TOKEN, what builds need (LANG, JAVA_HOME,
        ANDROID_HOME, SSH_AUTH_SOCK, a package registry token, proxies) and the AMK_ settings. Names of other variables
